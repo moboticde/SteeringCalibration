@@ -52,7 +52,7 @@ class DSACompat:
                         if hasattr(self.node.sdo, "timeout") and to_s is not None:
                             self.node.sdo.timeout = to_s
                         self.node.sdo.download(index, subindex, payload)
-                        return
+                        return 
                     finally:
                         if hasattr(self.node.sdo, "timeout") and old_to is not None:
                             self.node.sdo.timeout = old_to
@@ -72,37 +72,6 @@ class DSACompat:
         data = self.node.sdo.upload(index, subindex)
         return int.from_bytes(data, "little", signed=False)
 
-# --- NMT compat ---
-def nmt_reset_node_compat(nmt):
-    try:
-        nmt.reset_node()
-        print("[INFO] NMT: reset_node() sent.")
-        return True
-    except AttributeError:
-        pass
-    try:
-        nmt.reset_communication()
-        print("[INFO] NMT: reset_communication() sent.")
-        return True
-    except Exception:
-        pass
-    for s in ("RESET NODE", "RESET"):
-        try:
-            nmt.state = s
-            print(f"[INFO] NMT: state='{s}' sent.")
-            return True
-        except Exception:
-            continue
-    try:
-        nmt.state = "PRE-OPERATIONAL"
-        time.sleep(0.2)
-        nmt.state = "OPERATIONAL"
-        print("[INFO] NMT: toggled PRE-OPERATIONAL → OPERATIONAL.")
-        return True
-    except Exception:
-        pass
-    print("[WARN] Could not send any NMT reset command on this canopen version.")
-    return False
 
 # --- Steering script discovery (QR) ---
 def import_script_via_qr():
@@ -166,11 +135,12 @@ def main():
 
     # parse Dsa(1) and new_node_id from the file itself
     src = read_text(script_path)
-    parsed_node        = parse_dsa_node(src)       # e.g., 1 from Dsa(1)  <-- used as current Node-ID
+    parsed_node        = parse_dsa_node(src) 
+         # e.g., 1 from Dsa(1)  <-- used as current Node-ID
     parsed_new_node_id = parse_new_node_id(src)    # e.g., 50 from new_node_id = 50
 
     # Effective values (no CLI in this variant): parsed > script constants > fallback
-    bitrate     = script_bitrate if script_bitrate is not None else 125
+    bitrate     = script_bitrate if script_bitrate is not None else 250
     node        = parsed_node if parsed_node is not None else (script_node if script_node is not None else 59)
     set_node_id = parsed_new_node_id if parsed_new_node_id is not None else (script_set_id if script_set_id is not None else None)
 
@@ -178,36 +148,27 @@ def main():
 
     # Bring up CAN with BITRATE from script
     can = DriverCan(can_bitrate=bitrate)
+    mic = MicontrolF35_CAN(can=can.can_network, node=node)
+    if not mic.added_node:
+        print("[ERROR] Could not add CAN node.")
+        print(parsed_node) 
+        sys.exit(1)
+    dsa = DSACompat(mic.added_node)
+
+    print("[INFO] Applying configuration from steering script...")
+    # Your SteeringScript.InitPar(d) takes 1 arg
+    apply_fn(dsa)
+    print("[INFO] Configuration applied successfully.")
+
+    # Debug readback of Node-ID parameter (0x2000:02)
     try:
-        mic = MicontrolF35_CAN(can=can.can_network, node=node)
-        if not mic.added_node:
-            print("[ERROR] Could not add CAN node.")
-            sys.exit(1)
-        dsa = DSACompat(mic.added_node)
+        val = dsa.SdoRd(0x2000, 0x02)
+        print(f"[DBG] Readback 0x2000:02 (Node-ID param) = {val}")
+    except Exception as e:
+        print(f"[WARN] Could not read 0x2000:02 after config: {e}")
 
-        print("[INFO] Applying configuration from steering script...")
-        # Your SteeringScript.InitPar(d) takes 1 arg
-        apply_fn(dsa)
-        print("[INFO] Configuration applied successfully.")
-
-        # Debug readback of Node-ID parameter (0x2000:02)
-        try:
-            val = dsa.SdoRd(0x2000, 0x02)
-            print(f"[DBG] Readback 0x2000:02 (Node-ID param) = {val}")
-        except Exception as e:
-            print(f"[WARN] Could not read 0x2000:02 after config: {e}")
-
-        # Reset so new Node-ID takes effect (if any)
-        if set_node_id is not None:
-            if nmt_reset_node_compat(mic.added_node.nmt):
-                time.sleep(1.5)
-                print(f"[INFO] Device should now respond on Node-ID {set_node_id}.")
-            else:
-                print("[WARN] Please power-cycle the controller to finalize the Node-ID change.")
-        else:
-            print("[INFO] No new Node-ID detected in script; no NMT reset sent.")
-    finally:
-        can.close_can()
+    # Reset so new Node-ID takes effect (if any)
+    can.close_can()
 
 if __name__ == "__main__":
     main()
