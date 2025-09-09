@@ -27,7 +27,7 @@ class MicontrolF35_CAN:
                 
                 # Verify node is responding
                 if added_node.sdo.upload(0x1000, 0):  # Attempting to read device type (0x1000)
-                    #print(f"[INFO] MiControlF35 - Successfully added and verified Node {node_value} with EDS {self.eds}")
+                    print(f"[INFO] MiControlF35 - Successfully added and verified Node {node_value} with EDS {self.eds}")
                     return added_node
                 else:
                     print(f"[ERROR] Node {node_value} did not respond to SDO request.")

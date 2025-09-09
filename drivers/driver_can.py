@@ -28,13 +28,13 @@ class DriverCan:
 
             if self.can_network.bus is None:  # Check if the network was not previously connected
                 self.can_network.connect(interface='pcan', channel = 'PCAN_PCIBUS2', bitrate=self.can_bitrate)
-                #print("[SUCCESS] CANopen network connected!")
+                print("[SUCCESS] CANopen network connected!")
             else:
                 # Disconnect and reconnect the network
                 try:
                     self.can_network.disconnect()
                     self.can_network.connect(bustype='pcan', channel='PCAN_PCIBUS2', bitrate=self.can_bitrate)
-                    #print("[SUCCESS] Reconnected to CANopen network.")
+                    print("[SUCCESS] Reconnected to CANopen network.")
                 except Exception as e:
                     print(f"[ERROR] Failed to reconnect: {e}")
 

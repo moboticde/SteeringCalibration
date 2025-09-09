@@ -12,7 +12,7 @@
 
 def InitPar (d):
 
-   new_node_id = 2                                # new NodeId
+   new_node_id = 5                                # new NodeId
    d.SdoWr(0x2000, 0x01, 0x6E657277)               # write enable
    d.SdoWr(0x2000, 0x02, new_node_id, timeout=500) # set new NodeId
    #d.SdoWr(0x2000, 0x01, 0x6E657277)               # write enable
@@ -98,7 +98,7 @@ def InitPar (d):
 if __name__ == '__main__':
    from mc.dsa import *
 
-   d = Dsa(5)
+   d = Dsa(2)
 
    InitPar(d)
    print("code is executed")

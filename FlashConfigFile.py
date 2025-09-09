@@ -152,7 +152,7 @@ def main():
     if not mic.added_node:
         print("[ERROR] Could not add CAN node.")
         print(parsed_node) 
-        sys.exit(1)
+        #sys.exit(1)
     dsa = DSACompat(mic.added_node)
 
     print("[INFO] Applying configuration from steering script...")
