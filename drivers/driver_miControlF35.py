@@ -178,6 +178,12 @@ class MicontrolF35_CAN:
         if self.added_node:
             command = b'\x01\x00' if status else b'\x00\x00'
             self.added_node.sdo.download(0x3004, 0, command)
+    
+    def set_digital_output(self, status=True):
+        """Set digital output."""
+        if self.added_node:
+            dout = b'\x02\x00' if status else b'\x00\x00'
+            self.added_node.sdo.download(0x3150, 0, dout)
 
     def set_position_zero(self):
         """Set position to zero."""

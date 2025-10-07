@@ -3,6 +3,7 @@ import cv2
 import numpy as np
 import time
 import matplotlib.pyplot as plt
+from collections import deque
 
 # ------------------- CONFIG -------------------
 CAMERA_ID = 0
@@ -18,10 +19,10 @@ Y1, Y2 = None, None
 
 # Detection parameters
 MIN_AREA = 10
-R_MIN, R_MAX = 10, 100
+R_MIN, R_MAX = 5, 100
 CIRC_MIN = 0.6
-INNER_RADIUS = 200
-OUTER_RADIUS = 420
+INNER_RADIUS = 170
+OUTER_RADIUS = 225
 
 # Main circle parameters
 MIN_AREA_MAIN = 1000
@@ -30,9 +31,11 @@ CIRC_MIN_MAIN = 0.25
 
 # Lines
 VERTICAL_ANGLE_TOLERANCE = 10
-MIN_LINE_LENGTH = 220
 LINE_THICKNESS = 3
 ANGLE_EPS = 0.5  # stickiness band in degrees
+
+# ---- NEW: angle history (replaces LINE_TILT_HISTORY) ----
+ANGLE_HISTORY = deque(maxlen=30)
 
 # ---- ROI modes ----
 ROI_MODE = "auto_circle"   # "manual_base", "relative", or "auto_circle"
@@ -48,7 +51,6 @@ Y1_REL, Y2_REL = 0.00, 1.00
 DEBUG_DRAW_ALL_CONTOURS = True
 
 # ---- Ruler overlay config ----
-RULER_ENABLED = True
 RULER_BAND = 26          # thickness of top/left ruler bands in px
 RULER_MAJOR = 100        # major tick every N px
 RULER_MINOR = 10         # minor tick every N px
@@ -85,9 +87,9 @@ def process_image(image):
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (5, 5), 0)
     kernel = np.ones((3, 3), np.uint8)
-    dilated = cv2.dilate(blurred, kernel, iterations=2)
-    eroded = cv2.erode(dilated, kernel, iterations=1)
-    edges = cv2.Canny(eroded, 30, 150)
+    dilated = cv2.dilate(blurred, kernel, iterations=1) # save this
+    eroded = cv2.erode(dilated, kernel, iterations=3) # save this
+    edges = cv2.Canny(eroded, 200, 300)
     edges = cv2.morphologyEx(edges, cv2.MORPH_CLOSE, kernel)
     return eroded, edges
 
@@ -143,7 +145,6 @@ def draw_rulers(img, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR):
 
     # -------- Base-units ruler --------
     # mapping: base -> display pixels
-    # IMPORTANT: we draw after DISPLAY_SCALE is applied.
     scale_x = (CAMERA_WIDTH  / float(BASE_W)) * DISPLAY_SCALE
     scale_y = (CAMERA_HEIGHT / float(BASE_H)) * DISPLAY_SCALE
     if scale_x <= 1e-9 or scale_y <= 1e-9:
@@ -165,7 +166,6 @@ def draw_rulers(img, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR):
     maj_y = float(RULER_MAJOR_UNITS)
     min_y = float(RULER_MINOR_UNITS)
 
-    # round start to nearest minor multiple
     def start_at(minv, step):
         return math.ceil(minv / step) * step
 
@@ -173,16 +173,12 @@ def draw_rulers(img, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR):
     x_base = start_at(min_base_x, min_x)
     while x_base <= max_base_x + 1e-6:
         x_disp = int(round((cx if ORIGIN_CENTER else 0) + x_base * scale_x))
-        # tick style
         if abs((x_base / maj_x) - round(x_base / maj_x)) < 1e-6:
-            tlen, thick, col = band - 2, 2, (210, 210, 210)  # major
-            do_label = True
+            tlen, thick, col = band - 2, 2, (210, 210, 210); do_label = True
         elif abs((x_base / (maj_x / 2.0)) - round(x_base / (maj_x / 2.0))) < 1e-6:
-            tlen, thick, col = band // 2 + 4, 1, (180, 180, 180)
-            do_label = False
+            tlen, thick, col = band // 2 + 4, 1, (180, 180, 180); do_label = False
         else:
-            tlen, thick, col = band // 3, 1, (160, 160, 160)
-            do_label = False
+            tlen, thick, col = band // 3, 1, (160, 160, 160); do_label = False
         cv2.line(img, (x_disp, band), (x_disp, band - tlen), col, thick)
         if do_label:
             cv2.putText(img, f"{int(round(x_base))}", (x_disp + 2, band - 6),
@@ -206,12 +202,10 @@ def draw_rulers(img, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR):
                         cv2.FONT_HERSHEY_PLAIN, 1.0, (230, 230, 230), 1, cv2.LINE_AA)
         y_base += min_y
 
-    # center markers
     if ORIGIN_CENTER:
         cv2.line(img, (cx, band), (cx, 0), (255, 255, 255), 1)
         cv2.line(img, (band, cy), (0, cy), (255, 255, 255), 1)
     return img
-
 
 
 def draw_cursor_overlay(img, mouse_xy, disp_scale, in_scale):
@@ -234,13 +228,12 @@ def draw_cursor_overlay(img, mouse_xy, disp_scale, in_scale):
     x0_disp = x_disp - cx if ORIGIN_CENTER else x_disp
     y0_disp = (cy - y_disp) if (ORIGIN_CENTER and Y_AXIS_UP) else ((y_disp - cy) if ORIGIN_CENTER else y_disp)
 
-    # base-units mapping (matches your OUTER_RADIUS=440 scale)
+    # base-units mapping
     scale_x = (CAMERA_WIDTH  / float(BASE_W)) * DISPLAY_SCALE
     scale_y = (CAMERA_HEIGHT / float(BASE_H)) * DISPLAY_SCALE
     x0_base = x0_disp / max(scale_x, 1e-9)
     y0_base = y0_disp / max(scale_y, 1e-9)
 
-    # optional: keep old proc/src mapping if you want
     label = f"base:({int(round(x0_base))},{int(round(y0_base))})  disp:({x_disp},{y_disp})"
     (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.5, 1)
     bx = max(0, min(x_disp + 10, w - tw - 12))
@@ -249,6 +242,45 @@ def draw_cursor_overlay(img, mouse_xy, disp_scale, in_scale):
     cv2.putText(img, label, (bx, by - 2), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (240, 240, 240), 1, cv2.LINE_AA)
     return img
 
+
+# ------------------- NEW: Angle helpers -------------------
+
+def angle_cw_from_segment(x1, y1, x2, y2, cx, cy):
+    """
+    Angle in [0,360): clockwise from +Y (12 o'clock),
+    using the endpoint farther from center as the ray tip.
+    """
+    d1 = (x1 - cx) ** 2 + (y1 - cy) ** 2
+    d2 = (x2 - cx) ** 2 + (y2 - cy) ** 2
+    xf, yf = (x2, y2) if d2 > d1 else (x1, y1)
+
+    vx = xf - cx
+    vy = cy - yf          # image Y↓ -> math Y↑
+    ang = (math.degrees(math.atan2(vx, vy)) + 360.0) % 360.0
+    return ang
+
+def ang_diff(a, b):
+    """Smallest absolute difference between two angles (deg)."""
+    return abs((a - b + 180.0) % 360.0 - 180.0)
+
+def circular_mean(angles_deg):
+    """Mean direction of angles (deg) on the circle."""
+    if not angles_deg:
+        return None
+    s = sum(math.sin(math.radians(a)) for a in angles_deg)
+    c = sum(math.cos(math.radians(a)) for a in angles_deg)
+    if abs(s) < 1e-12 and abs(c) < 1e-12:
+        return None
+    return (math.degrees(math.atan2(s, c)) + 360.0) % 360.0
+
+def record_angle_and_get_avg(angle_deg):
+    """Record angle (deg) and return circular mean of the last N."""
+    if angle_deg is not None and 0.0 <= angle_deg < 360.0:
+        ANGLE_HISTORY.append(float(angle_deg))
+    return circular_mean(list(ANGLE_HISTORY)) if ANGLE_HISTORY else None
+
+def clear_angle_history():
+    ANGLE_HISTORY.clear()
 
 
 # ------------------- LINES -------------------
@@ -261,14 +293,14 @@ def detect_lines(edges, angle_tolerance=10, max_tilt=90):
         best_ang_x: float or None                        # ang_x of the longest line
     """
     H, W = edges.shape[:2]
-    cx, cy = W // 2, H // 2
+    cx, cy = W // 2 - 6, H // 2 - 91
 
     scale_factor = CAMERA_WIDTH / 1920.0
     R = int(OUTER_RADIUS * scale_factor)
 
     raw = cv2.HoughLinesP(
-        edges, rho=1, theta=np.pi / 180, threshold=50,
-        minLineLength=MIN_LINE_LENGTH, maxLineGap=20
+        edges, rho=1, theta=np.pi/360, threshold=10,
+        minLineLength=80, maxLineGap=None
     )
 
     def in_circle(x, y):
@@ -291,6 +323,7 @@ def detect_lines(edges, angle_tolerance=10, max_tilt=90):
                 best_ang_x = ang_x
 
     return lines_info, best_ang_x
+
 
 # ------------------- HOLES -------------------
 
@@ -360,20 +393,20 @@ def detect_holes(contours, hierarchy, center_x, center_y, inner_radius, outer_ra
             holes.append(cnt)
     return holes
 
+
+# ------------------- FRAME PIPELINE -------------------
 # ------------------- FRAME PIPELINE -------------------
 
-def process_frame(frame):
+def process_frame(frame, visualize=False):
     frame = cv2.resize(frame, None, fx=INPUT_SCALE, fy=INPUT_SCALE, interpolation=cv2.INTER_AREA)
     H, W = frame.shape[:2]
 
     eroded, edges = process_image(frame)
+    vis = cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR) if visualize else None
 
-    vis = frame.copy()
-    vis = cv2.cvtColor(eroded, cv2.COLOR_GRAY2BGR)
-    
-    # Get ROI bounds first
+    # ROI bounds
     def get_roi():
-        center_x, center_y = int(W / 2), int(H / 2)
+        center_x, center_y = int(W / 2 - 6), int(H / 2 - 91)
         scale_factor = CAMERA_WIDTH / 1920
         scaled_outer = int(OUTER_RADIUS * scale_factor)
         
@@ -389,7 +422,7 @@ def process_frame(frame):
             y1 = int(Y1_REL * H); y2 = int(Y2_REL * H)
             return x1, y1, x2, y2
 
-        else:  # "manual_base" - scale your X1..Y2 from BASE_W×BASE_H into current frame
+        else:  # "manual_base"
             _x1 = 0 if X1 is None else X1
             _x2 = W if X2 is None else X2
             _y1 = 0 if Y1 is None else Y1
@@ -398,138 +431,185 @@ def process_frame(frame):
             x2 = int(_x2 * W / BASE_W)
             y1 = int(_y1 * H / BASE_H)
             y2 = int(_y2 * H / BASE_H)
-            # clamp
             x1 = max(0, min(x1, W-1)); x2 = max(0, min(x2, W-1))
             y1 = max(0, min(y1, H-1)); y2 = max(0, min(y2, H-1))
             return x1, y1, x2, y2
 
     roi_bounds = get_roi()
     scaled_x1, scaled_y1, scaled_x2, scaled_y2 = roi_bounds
-    
-    # Lines inside circle (returns ang_x); we convert to vertical tilt
-    lines_info, _ = detect_lines(edges, angle_tolerance=VERTICAL_ANGLE_TOLERANCE)
 
-    # Pick stable line with ±ANGLE_EPS stickiness
-    prev_tilt = getattr(process_frame, "prev_tilt", None)
-    selected = None
-    if lines_info:
-        info = []  # (length, vtilt, x1,y1,x2,y2)
-        for (x1, y1, x2, y2, ang_x) in lines_info:
-            vtilt = abs(90.0 - float(ang_x))
-            length = math.hypot(x2 - x1, y2 - y1)
-            info.append((length, vtilt, x1, y1, x2, y2))
-        if prev_tilt is not None:
-            close = [t for t in info if abs(t[1] - prev_tilt) <= ANGLE_EPS]
-            selected = max(close, key=lambda t: t[0]) if close else max(info, key=lambda t: t[0])
-        else:
-            selected = max(info, key=lambda t: t[0])
-
-    best_tilt = None
-    if selected is not None:
-        length, tilt, x1, y1, x2, y2 = selected
-        best_tilt = tilt
-        cv2.line(vis, (x1, y1), (x2, y2), (0, 255, 255), LINE_THICKNESS)
-        mx, my = (x1 + x2) // 2, (y1 + y2) // 2
-        cv2.putText(vis, f"{tilt:.2f}", (mx + 6, my - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2)
-
-    # remember last tilt (for stickiness next frame)
-    process_frame.prev_tilt = best_tilt if best_tilt is not None else prev_tilt
-
-    # --- Visual references ---
-    center_x, center_y = int(W / 2), int(H / 2)
+    # Center + circles
+    center_x, center_y = int(W / 2 - 6), int(H / 2 - 91)
     scale_factor = CAMERA_WIDTH / 1920
     scaled_inner = int(INNER_RADIUS * scale_factor)
     scaled_outer = int(OUTER_RADIUS * scale_factor)
-    cv2.circle(vis, (center_x, center_y), scaled_inner, (0, 0, 255), 2)
-    cv2.circle(vis, (center_x, center_y), scaled_outer, (0, 0, 255), 2)
 
-    # Draw ROI rectangle
-    cv2.rectangle(vis, (scaled_x1, scaled_y1), (scaled_x2, scaled_y2), (0, 255, 255), 2)
+    # Lines inside circle
+    lines_info, _ = detect_lines(edges, angle_tolerance=VERTICAL_ANGLE_TOLERANCE)
 
-    # --- Holes with ROI constraint ---
-    contours, hierarchy = cv2.findContours(edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
-    if contours is not None and len(contours) > 0:
-        if hierarchy is None:
-            hierarchy = np.zeros((1, len(contours), 4), dtype=np.int32)
-            
-        # Detect main hole within ROI
-        main_hole, _ = detect_main_hole(contours, hierarchy, roi_bounds)
-        if main_hole is not None:
-            center = center_of(main_hole)
-            if center:
-                cv2.drawContours(vis, [main_hole], -1, (0, 255, 0), 2)
-                cv2.circle(vis, center, 5, (0, 0, 255), -1)
-                
-                # Detect other holes within ROI
-                holes = detect_holes(contours, hierarchy, center_x, center_y, scaled_inner, scaled_outer, roi_bounds)
-                for hole in holes:
-                    cv2.drawContours(vis, [hole], -1, (255, 0, 0), 2)
-                    hc = center_of(hole)
-                    if hc:
-                        cv2.circle(vis, hc, 3, (0, 255, 255), -1)
-                        
-    if DEBUG_DRAW_ALL_CONTOURS and contours is not None and len(contours) > 0:
-        cv2.drawContours(vis, contours, -1, (255, 0, 255), 1)  
-        
-    return vis, best_tilt
+    prev_angle = getattr(process_frame, "prev_angle", None)
+    selected = None
+    best_angle = None
+
+    if lines_info:
+        # Build candidates: (length, angleCW, x1,y1,x2,y2)
+        cand = []
+        for (x1, y1, x2, y2, _ang_x_unused) in lines_info:
+            length = math.hypot(x2 - x1, y2 - y1)
+            angleCW = angle_cw_from_segment(x1, y1, x2, y2, center_x, center_y)
+            cand.append((length, angleCW, x1, y1, x2, y2))
+
+        if prev_angle is not None:
+            close = [t for t in cand if ang_diff(t[1], prev_angle) <= ANGLE_EPS]
+            selected = max(close, key=lambda t: t[0]) if close else max(cand, key=lambda t: t[0])
+        else:
+            selected = max(cand, key=lambda t: t[0])
+
+    if selected is not None:
+        length, angleCW, x1, y1, x2, y2 = selected
+        best_angle = angleCW
+        if visualize and vis is not None:
+            cv2.line(vis, (x1, y1), (x2, y2), (165, 42, 42), LINE_THICKNESS)
+            # Label near farther endpoint (pointer tip)
+            d1 = (x1 - center_x)**2 + (y1 - center_y)**2
+            d2 = (x2 - center_x)**2 + (y2 - center_y)**2
+            lx, ly = (x2, y2) if d2 > d1 else (x1, y1)
+            cv2.putText(vis, f"{angleCW:6.2f}", (lx + 6, ly - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.7, (165, 42, 42), 2)
+
+    # remember across frames (wrap-safe)
+    process_frame.prev_angle = best_angle if best_angle is not None else prev_angle
+
+    if visualize and vis is not None:
+        # Visual references
+        cv2.circle(vis, (center_x, center_y), scaled_inner, (0, 0, 255), 2)
+        cv2.circle(vis, (center_x, center_y), scaled_outer, (0, 0, 255), 2)
+        # Draw ROI rectangle
+        cv2.rectangle(vis, (scaled_x1, scaled_y1), (scaled_x2, scaled_y2), (0, 255, 255), 2)
+
+        # Holes (only for debug visuals)
+        contours, hierarchy = cv2.findContours(edges, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_SIMPLE)
+        if contours is not None and len(contours) > 0:
+            if hierarchy is None:
+                hierarchy = np.zeros((1, len(contours), 4), dtype=np.int32)
+            main_hole, _ = detect_main_hole(contours, hierarchy, roi_bounds)
+            if main_hole is not None:
+                center = center_of(main_hole)
+                if center:
+                    cv2.drawContours(vis, [main_hole], -1, (0, 255, 0), 2)
+                    cv2.circle(vis, center, 5, (0, 0, 255), -1)
+                    holes = detect_holes(contours, hierarchy, center_x, center_y, scaled_inner, scaled_outer, roi_bounds)
+                    for hole in holes:
+                        cv2.drawContours(vis, [hole], -1, (255, 0, 0), 2)
+                        hc = center_of(hole)
+                        if hc:
+                            cv2.circle(vis, hc, 3, (0, 255, 255), -1)
+
+        if DEBUG_DRAW_ALL_CONTOURS and contours is not None and len(contours) > 0:
+            cv2.drawContours(vis, contours, -1, (255, 0, 255), 1)  
+
+    return vis, best_angle
+
 
 # ------------------- MAIN -------------------
 
-def AngleDetection():
+def AngleDetection(debug=False, return_after=10, timeout_s=None, cap=None):
+    """
+    Two modes:
+      - debug=True  → visual mode with window, rulers, cursor, live HUD; quit with 'q'
+      - debug=False → headless mode, returns avg angle after `return_after` samples or `timeout_s`
+    """
     global MOUSE_POS
-    cap = cv2.VideoCapture(CAMERA_ID)
-    if not cap.isOpened():
-        print("Error: Could not open webcam")
-        return
+    RULER_ENABLED = debug
+    start_all = time.time()
+    last_avg = None
 
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-    cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
+    owns_cap = cap is None
+    if owns_cap:
+        cap = cv2.VideoCapture(CAMERA_ID)
+        if not cap.isOpened():
+            print("Error: Could not open webcam")
+            return None
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+        cap.set(cv2.CAP_PROP_FPS, FPS_TARGET)
 
-    actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    print(f"Camera resolution: {actual_width}x{actual_height}")
+        actual_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        actual_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        if debug:
+            print(f"Camera resolution: {actual_width}x{actual_height}")
 
-    window_name = 'Zero Position'
-    cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
-    cv2.resizeWindow(window_name, CAMERA_WIDTH, CAMERA_HEIGHT)
-    cv2.setMouseCallback(window_name, on_mouse, None)
-
-    print("Press 'q' to quit")
+    if debug:
+        timeout_s = None  # no hard stop in debug
+        window_name = 'Zero Position'
+        cv2.namedWindow(window_name, cv2.WINDOW_NORMAL)
+        cv2.resizeWindow(window_name, CAMERA_WIDTH, CAMERA_HEIGHT)
+        cv2.setMouseCallback(window_name, on_mouse, None)
+        print("Press 'q' to quit | 'r' to reset average buffer")
 
     while True:
+        # headless timeout
+        if (not debug) and (timeout_s is not None) and ((time.time() - start_all) >= timeout_s):
+            break
+
         start_time = time.time()
         ret, frame = cap.read()
         if not ret:
             print("Error: Could not read frame")
             break
 
-        result, tilt = process_frame(frame)
+        vis, angleCW = process_frame(frame, visualize=debug)
+        avg_angle = record_angle_and_get_avg(angleCW)
+        if avg_angle is not None:
+            last_avg = avg_angle
 
-        if DISPLAY_SCALE != 1.0:
-            result = cv2.resize(result, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE, interpolation=cv2.INTER_AREA)
-
-        # Ruler overlay (drawn in display space so ticks match the mouse coords)
-        if RULER_ENABLED:
-            draw_rulers(result, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR)
-
-        # Cursor overlay (crosshair + coordinate bubble)
-        if MOUSE_POS is not None:
-            draw_cursor_overlay(result, MOUSE_POS, disp_scale=DISPLAY_SCALE, in_scale=INPUT_SCALE)
-
-        fps = 1.0 / (time.time() - start_time + 1e-6)
-        text = f"FPS: {fps:.1f}" + (f" | Tilt: {tilt:.1f}" if tilt is not None else "")
-        # keep FPS in top-right to avoid overlapping the left/top rulers too much
-        (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
-        H, W = result.shape[:2]
-        cv2.putText(result, text, (W - tw - 10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
-
-        cv2.imshow(window_name, result)
-        if cv2.waitKey(1) & 0xFF == ord('q'):
+        # headless early exit once enough samples collected
+        if (not debug) and (return_after is not None) and (len(ANGLE_HISTORY) >= return_after):
             break
 
-    cap.release()
-    cv2.destroyAllWindows()
-    
+        if debug:
+            result = vis if vis is not None else cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            if DISPLAY_SCALE != 1.0:
+                result = cv2.resize(result, None, fx=DISPLAY_SCALE, fy=DISPLAY_SCALE, interpolation=cv2.INTER_AREA)
+            # Ruler overlay
+            if RULER_ENABLED:
+                draw_rulers(result, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR)
+            # Cursor overlay
+            if MOUSE_POS is not None:
+                draw_cursor_overlay(result, MOUSE_POS, disp_scale=DISPLAY_SCALE, in_scale=INPUT_SCALE)
+
+            fps = 1.0 / (time.time() - start_time + 1e-6)
+            parts = [f"FPS: {fps:.1f}"]
+            if angleCW is not None:
+                parts.append(f"Angle: {angleCW:.1f}")
+            if avg_angle is not None:
+                parts.append(f"Avg30: {avg_angle:.1f}")
+            text = " | ".join(parts)
+
+            (tw, th), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.8, 2)
+            H, W = result.shape[:2]
+            cv2.putText(result, text, (W - tw - 10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+            cv2.imshow(window_name, result)
+            k = cv2.waitKey(1) & 0xFF
+            if k == ord('q'):
+                break
+            elif k == ord('r'):
+                clear_angle_history()
+                last_avg = None
+
+    if owns_cap:
+        cap.release()
+    if debug:
+        cv2.destroyAllWindows()
+    return last_avg
+
 if __name__ == "__main__":
-    AngleDetection()
+    # Example runs:
+    # 1) Headless: grab 10 samples and return their circular mean
+    avgAngle = AngleDetection(debug=True, return_after=10, timeout_s=None)
+    print(f"Angle: {avgAngle}")
+
+    # 2) Visual debug (press 'q' to quit)
+    # avgAngle = AngleDetection(debug=True)
+

@@ -1,16 +1,25 @@
 # drivers/driver_QRreader.py
+import sys
 import cv2
 import time
 
+def _preprocess_for_qr(bgr):
+    g = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    g = clahe.apply(g)
+    blur = cv2.GaussianBlur(g, (0,0), 1.0)
+    sharp = cv2.addWeighted(g, 1.5, blur, -0.5, 0)  # unsharp mask
+    return sharp
+
+
 def run_qr_reader(
     camera: int = 0,
-    width: int = 1280,
-    height: int = 720,
     show: bool = True,
     once: bool = False,
     timeout: float = 0.0,
     on_decode=None,          # optional callback(text:str, points:np.ndarray|None)
-    return_first: bool = False
+    return_first: bool = False,
+    cap = None,
 ):
     """
     Start webcam QR reader. Returns first decoded text if return_first=True, else None.
@@ -19,11 +28,23 @@ def run_qr_reader(
                signature: on_decode(text, points) where points is 4x2 corner array or None.
     """
     # CAP_DSHOW is helpful on Windows; harmless elsewhere
-    cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
-    if not cap.isOpened():
-        raise RuntimeError(f"Cannot open camera index {camera}")
+    owns_cap = cap is None
+    if owns_cap:
+        cap = cv2.VideoCapture(camera, cv2.CAP_DSHOW) 
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)   # higher native res -> more modules visible
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
+        cap.set(cv2.CAP_PROP_FPS, 60)             # if your camera supports it
+        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)       # cut capture latency
+
+        # Try to freeze optics (may be ignored if backend/driver blocks it)
+        cap.set(cv2.CAP_PROP_AUTOFOCUS, 0)
+        cap.set(cv2.CAP_PROP_FOCUS, 50)           # tune for your working distance
+        # Exposure (semantics vary by backend; values are device-specific)
+        cap.set(cv2.CAP_PROP_AUTO_EXPOSURE, 1)
+        cap.set(cv2.CAP_PROP_EXPOSURE, -6)
+
+        if not cap.isOpened():
+            raise RuntimeError(f"Cannot open camera index {camera}")
 
     detector = cv2.QRCodeDetector()
     seen = set()
@@ -37,10 +58,16 @@ def run_qr_reader(
                 break
 
             got_new = False
+            work = _preprocess_for_qr(frame)   # <<< use this
+
+            # if you try multiple scales:
+            for scale in (1.0, 1.5, 2.0):
+                img = work if scale == 1.0 else cv2.resize(work, None, fx=scale, fy=scale, interpolation=cv2.INTER_CUBIC)
+
 
             # Prefer multi-decode if available
             if hasattr(detector, "detectAndDecodeMulti"):
-                ok_multi, texts, points, _ = detector.detectAndDecodeMulti(frame)
+                ok_multi, texts, points, _ = detector.detectAndDecodeMulti(img)
                 if ok_multi and texts:
                     for i, t in enumerate(texts):
                         if t:
@@ -98,20 +125,7 @@ def run_qr_reader(
 
 # --- CLI entrypoint remains available ---
 if __name__ == "__main__":
-    import argparse
-    ap = argparse.ArgumentParser(description="Read QR codes from a camera and print text.")
-    ap.add_argument("--camera", type=int, default=0)
-    ap.add_argument("--width", type=int, default=1280)
-    ap.add_argument("--height", type=int, default=720)
-    ap.add_argument("--show", action="store_true")
-    ap.add_argument("--once", action="store_true")
-    ap.add_argument("--timeout", type=float, default=0)
-    args = ap.parse_args()
-    run_qr_reader(
-        camera=args.camera,
-        width=args.width,
-        height=args.height,
-        show=args.show,
-        once=args.once,
-        timeout=args.timeout
-    )
+    qrcode = run_qr_reader(show=True, once=True, return_first=True)
+    if not qrcode:
+        print("[ERROR] No QR detected. Aborting.")
+        sys.exit(1)
