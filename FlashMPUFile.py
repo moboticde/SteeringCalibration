@@ -4,6 +4,7 @@
 import os, sys, re, glob, importlib.util
 
 from io_helpers.find_product_folder import find_config
+from interrupt_guard import install_deferred_keyboard_interrupt
 from drivers.driver_QRreader import run_qr_reader
 from drivers.driver_can import DriverCan
 from drivers.driver_miControlF35 import MicontrolF35_CAN
@@ -75,7 +76,7 @@ def import_module_from_file(path: str):
     return mod
 
 # ---- main -------------------------------------------------------------------
-def main():
+def main(desired_node_id: int | None = None):
     mpu_path = resolve_mpu_via_qr()              # e.g. ...\01_SwConfiguration\my_program_run.py (or similar)
     prog_dir = os.path.dirname(mpu_path)
     program_path = os.path.join(prog_dir, "my_program.py")
@@ -86,6 +87,8 @@ def main():
 
     src = _read_text(program_path)
     node, bitrate, timeout = parse_node_bitrate_timeout(src)
+    if desired_node_id is not None:
+        node = desired_node_id
     print(f"[INFO] Using MPU params → NODE: {node} | BITRATE: {bitrate} kbit/s | TIMEOUT: {timeout} ms")
 
     can = DriverCan(can_bitrate=int(bitrate))
@@ -115,4 +118,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    restore_sigint = install_deferred_keyboard_interrupt(label="MPU flash")
+    try:
+        main()
+    finally:
+        restore_sigint()

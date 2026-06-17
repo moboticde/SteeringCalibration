@@ -1,0 +1,36 @@
+attempt=1
+analog_valid=True
+nonius_valid=True
+master_residuals_lsb=cosGain=-0.3021,sinOff=-0.3524,cosOff=-0.1859,phase=-0.4476
+nonius_residuals_lsb=cosGain=+0.1577,sinOff=+0.4342,cosOff=-0.3958,phase=-0.2460
+max_abs_analog_residual_lsb=0.4476
+final_residual_cap_lsb=20.0000
+phase_range_limit_lsb=256
+phase_margin_max_lsb=43
+phase_margin_min_lsb=-49
+max_abs_phase_margin_pct_of_range_limit=19.141
+upper_phase_clearance_pct=83.203
+lower_phase_clearance_pct=80.859
+max_allowed_phase_margin_pct=50.000
+max_abs_phase_error_lsb=341
+quality_ok=True
+quality_gate_reason=accepted: residual 0.4476 LSB <= 20.0000 LSB and nonius phase margin 19.141% <= 50.000% of range limit
+requested_frame_cycle_time_s=0.000187500000
+actual_frame_cycle_time_s=0.000187500000
+requested_clock_frequency_hz=2000000.000
+actual_clock_frequency_hz=2000000.000
+
+Analog residual history:
+analog_history_01=label=analog_run_01,analog_valid=True,master=cosGain=-2.9438,sinOff=+0.6300,cosOff=-0.1065,phase=+37.4274|nonius=cosGain=+1.3964,sinOff=+4.3529,cosOff=+3.5440,phase=+32.1448
+analog_history_02=label=analog_run_02,analog_valid=True,master=cosGain=-3.2846,sinOff=-0.3434,cosOff=-0.1369,phase=+1.5639|nonius=cosGain=-2.5187,sinOff=+0.4296,cosOff=-0.3594,phase=+0.8538
+analog_history_03=label=analog_run_03,analog_valid=True,master=cosGain=-0.3021,sinOff=-0.3524,cosOff=-0.1859,phase=-0.4476|nonius=cosGain=+0.1577,sinOff=+0.4342,cosOff=-0.3958,phase=-0.2460
+
+Analyze result log:
+Number of analyzed raw data samples: 64000
+Number of configured master periods: 32
+Number of calculated master periods: 32
+Number of revolutions: 2.852
+Number of acquired master periods: 91.256
+Number of acquired nonius periods: 88.398
+Minimal number of samples per master period: 676.937
+Average number of samples per master period: 701.325

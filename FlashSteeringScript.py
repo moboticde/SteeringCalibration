@@ -1,6 +1,7 @@
 # FlashConfigFile.py
 import os, sys, time, argparse, importlib.util, inspect, re
 from io_helpers.find_product_folder import find_config
+from interrupt_guard import install_deferred_keyboard_interrupt
 from drivers.driver_QRreader import run_qr_reader
 from drivers.driver_can import DriverCan
 from drivers.driver_miControlF35 import MicontrolF35_CAN
@@ -56,7 +57,7 @@ def parse_new_node_id(src_text):
     m = re.search(r'\bnew_node_id\s*=\s*(\d+)', src_text)
     return int(m.group(1)) if m else None
 
-def main():
+def main(desired_node_id: int | None = None):
     script_path = import_script_via_qr()
 
     print(f"[INFO] Using script: {script_path}")
@@ -73,9 +74,13 @@ def main():
          # e.g., 1 from Dsa(1)  <-- used as current Node-ID
     parsed_new_node_id = parse_new_node_id(src)    # e.g., 50 from new_node_id = 50
 
-    # Effective values (no CLI in this variant): parsed > script constants > fallback
+    # Effective values (no CLI in this variant): override > parsed > script constants > fallback
     bitrate     = script_bitrate if script_bitrate is not None else 125
-    node        = parsed_node if parsed_node is not None else (script_node if script_node is not None else 59)
+    node = (
+        desired_node_id
+        if desired_node_id is not None
+        else (parsed_node if parsed_node is not None else (script_node if script_node is not None else 59))
+    )
     set_node_id = parsed_new_node_id if parsed_new_node_id is not None else (script_set_id if script_set_id is not None else None)
 
     print(f"[INFO] Params -> BITRATE: {bitrate} kbit/s | NODE: {node} | SET_NODE_ID: {set_node_id}")
@@ -109,4 +114,8 @@ def main():
     can.close_can()
 
 if __name__ == "__main__":
-    main()
+    restore_sigint = install_deferred_keyboard_interrupt(label="steering script flash")
+    try:
+        main()
+    finally:
+        restore_sigint()

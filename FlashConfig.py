@@ -29,7 +29,7 @@ def import_script_via_qr():
     print("[ERROR] No SteeringScript.py found in 01_SwConfiguration.")
     sys.exit(1)
 
-def main():
+def main(desired_node_id: int | None = None):
     script_path = import_script_via_qr()
     print(f"[INFO] Using script: {script_path}")
 
@@ -40,7 +40,7 @@ def main():
     print(f"[INFO] Summary -> kind={info['kind']} | node={info['params'].get('current_node_id')} | new_node={info['params'].get('new_node_id')} | bitrate={info['can_bitrate_kbit']}")
 
     p = cp.params
-    node = int(p["current_node_id"])
+    node = desired_node_id if desired_node_id is not None else int(p["current_node_id"])
     print(f"[INFO] Opening CAN at {cp.can_bitrate_kbit} kbit/s, current Node-ID={node}")
     can = DriverCan(can_bitrate=cp.can_bitrate_kbit)
     try:

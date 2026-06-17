@@ -5861,7 +5861,7 @@ DefaultValue=
 PDOMapping=1
 
 [3380]
-ParameterName=Velocity acceleration in [rev/min²]
+ParameterName=Velocity acceleration in [rev/min2]
 ObjectType=7
 DataType=0x7
 LowLimit=0
@@ -5871,7 +5871,7 @@ DefaultValue=0
 PDOMapping=1
 
 [3381]
-ParameterName=Velocity deceleration in [rev/min²]
+ParameterName=Velocity deceleration in [rev/min2]
 ObjectType=7
 DataType=0x7
 LowLimit=0
@@ -5881,7 +5881,7 @@ DefaultValue=0
 PDOMapping=1
 
 [3382]
-ParameterName=Velocity quick-stop deceleration in [rev/min²]
+ParameterName=Velocity quick-stop deceleration in [rev/min2]
 ObjectType=7
 DataType=0x7
 LowLimit=0

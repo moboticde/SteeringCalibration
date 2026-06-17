@@ -21,8 +21,8 @@ Y1, Y2 = None, None
 MIN_AREA = 10
 R_MIN, R_MAX = 5, 100
 CIRC_MIN = 0.6
-INNER_RADIUS = 170
-OUTER_RADIUS = 225
+INNER_RADIUS = 225
+OUTER_RADIUS = 300
 
 # Main circle parameters
 MIN_AREA_MAIN = 1000
@@ -65,6 +65,12 @@ RULER_IN_BASE_UNITS = True  # <-- show labels in base units (1920×1080)
 RULER_MAJOR_UNITS = 100     # major tick every 100 base units
 RULER_MINOR_UNITS = 10      # minor tick every 10 base units
 
+# Origin offset in base units (where base (-50, 10) becomes display zero)
+ORIGIN_OFFSET_X_BASE = 50
+ORIGIN_OFFSET_Y_BASE = 16
+ORIGIN_OFFSET_X_PIXEL = ORIGIN_OFFSET_X_BASE * (CAMERA_WIDTH / BASE_W)
+ORIGIN_OFFSET_Y_PIXEL = ORIGIN_OFFSET_Y_BASE * (CAMERA_HEIGHT / BASE_H)
+
 
 # ------------------- HELPERS -------------------
 
@@ -104,7 +110,8 @@ def draw_rulers(img, band=RULER_BAND, major=RULER_MAJOR, minor=RULER_MINOR):
     if band <= 0:
         return img
     h, w = img.shape[:2]
-    cx, cy = w // 2, h // 2
+    cx = int(w // 2 - ORIGIN_OFFSET_X_PIXEL)
+    cy = int(h // 2 - ORIGIN_OFFSET_Y_PIXEL)
 
     # dark bands
     cv2.rectangle(img, (0, 0), (w, band), (40, 40, 40), -1)   # top
@@ -217,7 +224,8 @@ def draw_cursor_overlay(img, mouse_xy, disp_scale, in_scale):
     if x_disp < 0 or y_disp < 0 or x_disp >= w or y_disp >= h:
         return img
 
-    cx, cy = w // 2, h // 2
+    cx = int(w // 2 - ORIGIN_OFFSET_X_PIXEL)
+    cy = int(h // 2 - ORIGIN_OFFSET_Y_PIXEL)
 
     # crosshair
     cv2.line(img, (x_disp, 0), (x_disp, h - 1), (0, 255, 0), 1, cv2.LINE_AA)
@@ -293,7 +301,8 @@ def detect_lines(edges, angle_tolerance=10, max_tilt=90):
         best_ang_x: float or None                        # ang_x of the longest line
     """
     H, W = edges.shape[:2]
-    cx, cy = W // 2 - 6, H // 2 - 91
+    cx = int(W // 2 - ORIGIN_OFFSET_X_PIXEL)
+    cy = int(H // 2 - ORIGIN_OFFSET_Y_PIXEL)
 
     scale_factor = CAMERA_WIDTH / 1920.0
     R = int(OUTER_RADIUS * scale_factor)
@@ -406,7 +415,8 @@ def process_frame(frame, visualize=False):
 
     # ROI bounds
     def get_roi():
-        center_x, center_y = int(W / 2 - 6), int(H / 2 - 91)
+        center_x = int(W / 2 - ORIGIN_OFFSET_X_PIXEL)
+        center_y = int(H / 2 - ORIGIN_OFFSET_Y_PIXEL)
         scale_factor = CAMERA_WIDTH / 1920
         scaled_outer = int(OUTER_RADIUS * scale_factor)
         
@@ -438,8 +448,9 @@ def process_frame(frame, visualize=False):
     roi_bounds = get_roi()
     scaled_x1, scaled_y1, scaled_x2, scaled_y2 = roi_bounds
 
-    # Center + circles
-    center_x, center_y = int(W / 2 - 6), int(H / 2 - 91)
+    # Center + circles (aligned to origin offset)
+    center_x = int(W / 2 - ORIGIN_OFFSET_X_PIXEL)
+    center_y = int(H / 2 - ORIGIN_OFFSET_Y_PIXEL)
     scale_factor = CAMERA_WIDTH / 1920
     scaled_inner = int(INNER_RADIUS * scale_factor)
     scaled_outer = int(OUTER_RADIUS * scale_factor)
@@ -526,7 +537,7 @@ def AngleDetection(debug=False, return_after=10, timeout_s=None, cap=None):
 
     owns_cap = cap is None
     if owns_cap:
-        cap = cv2.VideoCapture(CAMERA_ID)
+        cap = cv2.VideoCapture(CAMERA_ID,cv2.CAP_V4L2)
         if not cap.isOpened():
             print("Error: Could not open webcam")
             return None
