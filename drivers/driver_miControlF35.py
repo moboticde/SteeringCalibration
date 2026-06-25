@@ -41,19 +41,33 @@ class MicontrolF35_CAN:
         """Automatically adds nodes for MiControl CAN when the class is initialized."""
         if self.node_id is not None:
             node_value = int(self.node_id)  # Convert to int
-            try:
-                added_node = self.can.add_node(node_value, self.eds)
-                
-                # Verify node is responding
-                if added_node.sdo.upload(0x1000, 0):  # Attempting to read device type (0x1000)
-                    print(f"[INFO] MiControlF35 - Successfully added and verified Node {node_value} with EDS {self.eds}")
-                    return added_node
-                else:
-                    print(f"[ERROR] Node {node_value} did not respond to SDO request.")
-                    return None
-            except Exception as e:
-                print(f"[ERROR] Failed to add node {node_value}: {e}")
-                return None
+            added_node = self.can.add_node(node_value, self.eds)
+            probes = (
+                (0x1000, 0x00, "device type"),
+                (0x2000, 0x02, "node id parameter"),
+                (0x3001, 0x00, "error code"),
+            )
+            last_error = None
+            for attempt in range(1, 4):
+                for index, subindex, label in probes:
+                    try:
+                        added_node.sdo.upload(index, subindex)
+                        print(
+                            f"[INFO] MiControlF35 - Successfully verified Node {node_value} "
+                            f"via {label} 0x{index:04X}:{subindex:02X} with EDS {self.eds}"
+                        )
+                        return added_node
+                    except Exception as e:
+                        last_error = e
+                        if e.__class__.__name__ == "SdoAbortedError":
+                            print(
+                                f"[WARN] Node {node_value} responded with SDO abort on "
+                                f"0x{index:04X}:{subindex:02X}; treating node as reachable: {e}"
+                            )
+                            return added_node
+                time.sleep(0.25 * attempt)
+            print(f"[ERROR] Failed to add node {node_value}: {last_error}")
+            return None
         return None
 
     def clear_errors(self):
@@ -237,6 +251,8 @@ class MicontrolF35_CAN:
 
         node = self.added_node
         error_value = None
+        self.last_ssi_configuration_error = None
+        self.last_ssi_configuration_check_ok = False
         restored_extended_ssi = False
 
         self.clear_errors()
@@ -270,6 +286,7 @@ class MicontrolF35_CAN:
         if not restored_extended_ssi:
             return False
 
+        self.last_ssi_configuration_error = error_value
         if error_value == -1092:
             print("[ERROR] Controller error -1092 detected after configuration.")
             return False
@@ -277,6 +294,7 @@ class MicontrolF35_CAN:
             print(f"[ERROR] Unexpected controller error after configuration: {error_value}.")
             return False
 
+        self.last_ssi_configuration_check_ok = True
         print("[INFO] No controller error -1092 detected; extended SSI mode restored.")
         return True
 

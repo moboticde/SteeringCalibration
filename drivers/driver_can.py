@@ -1,6 +1,8 @@
 
 import canopen
 import os, time
+import re
+import subprocess
 import yaml
 
 # Load VID and PID from config
@@ -13,7 +15,8 @@ TARGET_PID = int(config["can"]["PID"])
 
 class DriverCan:
     def __init__(self, can_bitrate, interface=None, channel=None):
-        self.can_bitrate = can_bitrate * 1000
+        self.can_bitrate_kbit = int(float(can_bitrate))
+        self.can_bitrate = self.can_bitrate_kbit * 1000
         self.interface = (
             interface if interface is not None else os.getenv("ST_CAN_INTERFACE", "socketcan")
         )
@@ -32,8 +35,68 @@ class DriverCan:
         self.can_network = canopen.Network()
 
         time.sleep(3)  # Allow time for the CAN interface to stabilize
+        if self.interface == "socketcan":
+            self.ensure_socketcan_bitrate()
         self.initialize_canopen()
 
+    def _run_ip(self, *args):
+        return subprocess.run(
+            ["ip", *args],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+
+    def _socketcan_status(self):
+        result = self._run_ip("-details", "link", "show", self.channel)
+        if result.returncode != 0:
+            detail = (result.stderr or result.stdout).strip()
+            if "does not exist" in detail:
+                detail = (
+                    f"{detail}. SocketCAN interface {self.channel} is missing; "
+                    "connect the CAN adapter, load its kernel driver, or set "
+                    "ST_CAN_CHANNEL to the actual CAN interface name."
+                )
+            raise RuntimeError(
+                f"Could not inspect CAN interface {self.channel}: "
+                f"{detail}"
+            )
+        return result.stdout
+
+    def ensure_socketcan_bitrate(self):
+        """Ensure socketcan is configured to the requested bitrate before CANopen starts."""
+        status = self._socketcan_status()
+        match = re.search(r"\bbitrate\s+(\d+)\b", status)
+        current_bitrate = int(match.group(1)) if match else None
+        if current_bitrate == 0 and "clock 0" in status:
+            return
+        if current_bitrate == self.can_bitrate:
+            return
+
+        for args in (
+            ("link", "set", self.channel, "down"),
+            ("link", "set", self.channel, "type", "can", "bitrate", str(self.can_bitrate)),
+            ("link", "set", self.channel, "up"),
+        ):
+            result = self._run_ip(*args)
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"CAN interface {self.channel} bitrate is {current_bitrate}, "
+                    f"expected {self.can_bitrate}. Could not configure it automatically: {detail}. "
+                    f"Run: sudo ip link set {self.channel} down && "
+                    f"sudo ip link set {self.channel} type can bitrate {self.can_bitrate} && "
+                    f"sudo ip link set {self.channel} up"
+                )
+
+        status = self._socketcan_status()
+        match = re.search(r"\bbitrate\s+(\d+)\b", status)
+        configured_bitrate = int(match.group(1)) if match else None
+        if configured_bitrate != self.can_bitrate:
+            raise RuntimeError(
+                f"CAN interface {self.channel} bitrate is {configured_bitrate}, "
+                f"expected {self.can_bitrate}."
+            )
 
     def initialize_canopen(self):
         """Initialize or reconnect to CANopen communication with error handling."""

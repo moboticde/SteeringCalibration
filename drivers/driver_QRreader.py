@@ -26,7 +26,7 @@ import numpy as np
 _configure_qt_environment()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from interrupt_guard import install_deferred_keyboard_interrupt
+from utils.interrupt_guard import install_deferred_keyboard_interrupt
 
 # Window / camera configuration
 WINDOW_NAME = "QR Reader"

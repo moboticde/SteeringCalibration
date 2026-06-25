@@ -1,36 +1,36 @@
 attempt=1
 analog_valid=True
 nonius_valid=True
-master_residuals_lsb=cosGain=-0.5060,sinOff=-0.1100,cosOff=+0.3068,phase=-0.3939
-nonius_residuals_lsb=cosGain=-0.2004,sinOff=+0.3997,cosOff=-0.2166,phase=-0.0259
-max_abs_analog_residual_lsb=0.5060
+master_residuals_lsb=cosGain=-0.1549,sinOff=-0.2343,cosOff=+0.2761,phase=-0.4250
+nonius_residuals_lsb=cosGain=-0.0427,sinOff=+0.2282,cosOff=-0.2967,phase=-0.0227
+max_abs_analog_residual_lsb=0.4250
 final_residual_cap_lsb=20.0000
 phase_range_limit_lsb=256
-phase_margin_max_lsb=46
-phase_margin_min_lsb=-44
+phase_margin_max_lsb=43
+phase_margin_min_lsb=-46
 max_abs_phase_margin_pct_of_range_limit=17.969
-upper_phase_clearance_pct=82.031
-lower_phase_clearance_pct=82.812
+upper_phase_clearance_pct=83.203
+lower_phase_clearance_pct=82.031
 max_allowed_phase_margin_pct=50.000
-max_abs_phase_error_lsb=343
+max_abs_phase_error_lsb=341
 quality_ok=True
-quality_gate_reason=accepted: residual 0.5060 LSB <= 20.0000 LSB and nonius phase margin 17.969% <= 50.000% of range limit
+quality_gate_reason=accepted: residual 0.4250 LSB <= 20.0000 LSB and nonius phase margin 17.969% <= 50.000% of range limit
 requested_frame_cycle_time_s=0.000187500000
 actual_frame_cycle_time_s=0.000187500000
 requested_clock_frequency_hz=2000000.000
 actual_clock_frequency_hz=2000000.000
 
 Analog residual history:
-analog_history_01=label=analog_run_01,analog_valid=True,master=cosGain=-2.9063,sinOff=+1.8341,cosOff=-0.6704,phase=+38.9230|nonius=cosGain=+3.7548,sinOff=-4.8309,cosOff=+9.1469,phase=+34.4664
-analog_history_02=label=analog_run_02,analog_valid=True,master=cosGain=-3.0295,sinOff=-0.2120,cosOff=+0.3371,phase=+1.1042|nonius=cosGain=-2.9827,sinOff=+0.3956,cosOff=-0.1460,phase=+1.3905
-analog_history_03=label=analog_run_03,analog_valid=True,master=cosGain=-0.5060,sinOff=-0.1100,cosOff=+0.3068,phase=-0.3939|nonius=cosGain=-0.2004,sinOff=+0.3997,cosOff=-0.2166,phase=-0.0259
+analog_history_01=label=analog_run_01,analog_valid=True,master=cosGain=-2.7623,sinOff=+1.7768,cosOff=-0.7055,phase=+38.9319|nonius=cosGain=+3.8423,sinOff=-4.9952,cosOff=+9.1283,phase=+34.4765
+analog_history_02=label=analog_run_02,analog_valid=True,master=cosGain=-2.7907,sinOff=-0.2459,cosOff=+0.2710,phase=+1.0979|nonius=cosGain=-2.8376,sinOff=+0.2776,cosOff=-0.2032,phase=+1.3894
+analog_history_03=label=analog_run_03,analog_valid=True,master=cosGain=-0.1549,sinOff=-0.2343,cosOff=+0.2761,phase=-0.4250|nonius=cosGain=-0.0427,sinOff=+0.2282,cosOff=-0.2967,phase=-0.0227
 
 Analyze result log:
 Number of analyzed raw data samples: 64000
 Number of configured master periods: 32
 Number of calculated master periods: 32
-Number of revolutions: 2.854
-Number of acquired master periods: 91.327
-Number of acquired nonius periods: 88.475
-Minimal number of samples per master period: 677.375
-Average number of samples per master period: 700.775
+Number of revolutions: 2.852
+Number of acquired master periods: 91.268
+Number of acquired nonius periods: 88.417
+Minimal number of samples per master period: 677.594
+Average number of samples per master period: 701.234

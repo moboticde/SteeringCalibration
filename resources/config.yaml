@@ -1,6 +1,6 @@
 arduino:
   VID: 0x2341
-  PID: 0x0042
+  PID: 0x003E
   BITRATE: 115200
 
 multimeter:
