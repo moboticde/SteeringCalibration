@@ -1,0 +1,21 @@
+# Python/runtime caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.cache/
+.history/
+
+# Local environments
+.venv/
+
+# Generated calibration/runtime artifacts
+MU/calib_logs/
+MU/config_backups/
+tests/MU/calib_logs/
+
+# Product run results generated during local operation
+S-1000-200/*/04_Results/
+
+# Generic logs
+*.log
