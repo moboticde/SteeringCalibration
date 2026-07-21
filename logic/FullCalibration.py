@@ -1,3 +1,4 @@
+import argparse
 import ctypes
 from ctypes import (
     c_int, c_int8, c_long, c_uint8, c_uint16, c_uint32, c_ulong, c_size_t,
@@ -6,8 +7,13 @@ from ctypes import (
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
+import sys
 import time
-from typing import Optional
+from typing import Optional, Sequence
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
 
 from logic.calibration_quality import (
     AcquisitionTiming,
@@ -22,7 +28,6 @@ from drivers.driver_miControlF35 import MicontrolF35_CAN
 from drivers.driver_can import DriverCan
 from drivers.driver_mc import DSACompat
 from drivers.driver_cam_st import AngleDetection
-from drivers.driver_owon import power_cycle_owon_spe6053
 from utils.config_processing import nmt_reset_node_compat
 from utils.interrupt_guard import install_deferred_keyboard_interrupt
 from logic.FlashSteeringScript import import_script_via_qr, load_config_function
@@ -59,6 +64,20 @@ EXPORT_DIR_1 = Path(
 EXPORT_DIR_2 = Path(
     r"/home/mobotic/Internal Projects/StCalibration-Linux/MU/calib_logs/enc_2"
 )
+
+DEFAULT_SERIAL_LAST4 = ""
+DEFAULT_CAN_BITRATE = 125
+DEFAULT_NODE_ID = 50
+DEFAULT_DESIRED_CURRENT = 3000
+DEFAULT_SPINUP_SECONDS = 60.0
+DEFAULT_SAMPLES = 64000
+DEFAULT_FRAME_CYCLE_TIME_S = 187.5e-6
+DEFAULT_CLOCK_FREQUENCY_HZ = 2.0e6
+DEFAULT_MAX_ANALOG_RUNS = 3
+DEFAULT_RESIDUAL_LIMIT_LSB = 1.0
+DEFAULT_FINAL_RESIDUAL_CAP_LSB = 20.0
+DEFAULT_MAX_CALIBRATION_ATTEMPTS = 2
+DEFAULT_MAX_PHASE_MARGIN_PCT = 50.0
 
 mu = ctypes.CDLL(str(DLL_PATH))
 
@@ -590,12 +609,12 @@ def _write_params_preserving(
     return MU_OK
 
 
-def _save_original_config_backup(handle: MU_Handle, export_dir: Path) -> bool:
+def _save_original_config_backup(handle: MU_Handle, export_dir: Path) -> Path | None:
     backup_path = export_dir / (
         "original_config_before_calibration_"
         f"{datetime.now().strftime('%Y%m%d_%H%M%S')}.cfg"
     )
-    return _save_mu_config(handle, backup_path)
+    return backup_path if _save_mu_config(handle, backup_path) else None
 
 
 def _enter_biss(handle) -> bool:
@@ -967,6 +986,15 @@ def _save_mu_config(handle: MU_Handle, config_path: Path | None) -> bool:
     return ret == MU_OK
 
 
+def _load_mu_config(handle: MU_Handle, config_path: Path | None) -> bool:
+    if not config_path:
+        return False
+
+    ret = mu.MU_LoadParams(handle, str(config_path).encode("utf-8"))
+    _log_mu(f"Load MU config <- {config_path}", ret, handle)
+    return ret == MU_OK
+
+
 def _get_analyze_result_log(analyze: c_void_p) -> str:
     size = int(
         mu.MU_Calibration_getAnalyzeResultLog(
@@ -1267,7 +1295,8 @@ def calibrate_one_encoder(
         if protected_params is None:
             print("[ERROR] Could not capture protected MU params; aborting calibration.")
             return False
-        if not _save_original_config_backup(handle, export_dir):
+        original_config_backup_path = _save_original_config_backup(handle, export_dir)
+        if original_config_backup_path is None:
             print("[ERROR] Could not save original MU config backup; aborting calibration.")
             return False
 
@@ -1643,6 +1672,14 @@ def calibrate_one_encoder(
             f"[ERROR] Calibration failed after {max_calibration_attempts} attempts. "
             "The report files contain the final MU error metrics."
         )
+        print("[INFO] Restoring original MU config after failed calibration.")
+        if _load_mu_config(handle, original_config_backup_path):
+            if write_params_preserving_and_report(
+                "restore original config after failed calibration",
+            ) != MU_OK:
+                print("[WARN] Original MU config load succeeded, but RAM restore failed.")
+        else:
+            print("[WARN] Could not reload original MU config after failed calibration.")
         return False
 
     finally:
@@ -1662,10 +1699,20 @@ def calibrate_one_encoder(
 # =====================================================================================
 # CAN controller restart
 # =====================================================================================
-def restart_controller(can: DriverCan, mic: MicontrolF35_CAN, node: int, can_bitrate: int):
-    power_cycled = power_cycle_owon_spe6053(off_seconds=3.0, voltage_v=24.0, current_a=5.0)
+def restart_controller(
+    can: DriverCan,
+    mic: MicontrolF35_CAN,
+    node: int,
+    can_bitrate: int,
+    power_cycle_wait_fn=None,
+):
+    power_cycled = False
+    if power_cycle_wait_fn is not None:
+        print("[STATUS] Restarting controller power through relay control.")
+        power_cycled = bool(power_cycle_wait_fn(600.0))
     if not power_cycled and mic and mic.added_node:
         try:
+            print("[STATUS] Restarting controller through CAN NMT reset.")
             nmt_reset_node_compat(mic.added_node.nmt)
         except Exception as exc:
             print(f"[WARN] Failed to request controller reset: {exc}")
@@ -1785,10 +1832,21 @@ def wait_until_current_reached(
 # MAIN
 # =====================================================================================
 def main(
-    serial_last4: str = "",
-    can_bitrate: int = 125,
-    node: int = 50,
+    serial_last4: str = DEFAULT_SERIAL_LAST4,
+    can_bitrate: int = DEFAULT_CAN_BITRATE,
+    node: int = DEFAULT_NODE_ID,
+    desired_current: int = DEFAULT_DESIRED_CURRENT,
+    spinup_seconds: float = DEFAULT_SPINUP_SECONDS,
+    n_samples: int = DEFAULT_SAMPLES,
+    frame_cycle_time_s: float = DEFAULT_FRAME_CYCLE_TIME_S,
+    clock_frequency_hz: float = DEFAULT_CLOCK_FREQUENCY_HZ,
+    max_analog_runs: int = DEFAULT_MAX_ANALOG_RUNS,
+    residual_limit_lsb: float = DEFAULT_RESIDUAL_LIMIT_LSB,
+    final_residual_cap_lsb: float = DEFAULT_FINAL_RESIDUAL_CAP_LSB,
+    max_calibration_attempts: int = DEFAULT_MAX_CALIBRATION_ATTEMPTS,
+    max_phase_margin_pct: float = DEFAULT_MAX_PHASE_MARGIN_PCT,
     result_callback=None,
+    power_cycle_wait_fn=None,
 ):
 
     # CAN setup
@@ -1819,18 +1877,32 @@ def main(
         mic.clear_errors()
         mic.enabled(True)
 
-        desired_current = 3000
+        print(
+            "[INFO] FullCalibration run parameters: "
+            f"node={node} can_bitrate={can_bitrate}kbit/s "
+            f"desired_current={desired_current} spinup_seconds={spinup_seconds:.1f} "
+            f"samples={n_samples} max_phase_margin_pct={max_phase_margin_pct:.3f}"
+        )
         mic.set_desired_current(desired_current)
 
         mic.set_digital_output(True)  # select enc 0 by default
 
-        time.sleep(60)
+        if spinup_seconds > 0:
+            time.sleep(spinup_seconds)
         wait_until_current_reached(mic, desired_current, tolerance=100, timeout_s=None)
 
         ok_enc_1 = calibrate_one_encoder(
             export_dir=EXPORT_DIR_1,
             serial_last4=serial_last4,
             saved_config_path=CALIBRATED_CONFIG_PATH_1,
+            n_samples=n_samples,
+            frame_cycle_time_s=frame_cycle_time_s,
+            clock_frequency_hz=clock_frequency_hz,
+            max_analog_runs=max_analog_runs,
+            residual_limit_lsb=residual_limit_lsb,
+            final_residual_cap_lsb=final_residual_cap_lsb,
+            max_calibration_attempts=max_calibration_attempts,
+            max_phase_margin_pct=max_phase_margin_pct,
             quality_callback=(
                 lambda data: result_callback(
                     {"event": "quality", "encoder": 1, **data}
@@ -1859,6 +1931,14 @@ def main(
             export_dir=EXPORT_DIR_2,
             serial_last4=serial_last4,
             saved_config_path=CALIBRATED_CONFIG_PATH_2,
+            n_samples=n_samples,
+            frame_cycle_time_s=frame_cycle_time_s,
+            clock_frequency_hz=clock_frequency_hz,
+            max_analog_runs=max_analog_runs,
+            residual_limit_lsb=residual_limit_lsb,
+            final_residual_cap_lsb=final_residual_cap_lsb,
+            max_calibration_attempts=max_calibration_attempts,
+            max_phase_margin_pct=max_phase_margin_pct,
             quality_callback=(
                 lambda data: result_callback(
                     {"event": "quality", "encoder": 2, **data}
@@ -1920,6 +2000,7 @@ def main(
                 mic=mic,
                 node=node,
                 can_bitrate=can_bitrate,
+                power_cycle_wait_fn=power_cycle_wait_fn,
             )
             if restarted_can and restarted_mic:
                 can, mic = restarted_can, restarted_mic
@@ -1938,9 +2019,113 @@ def main(
         except Exception:
             pass
 
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Run the full calibration flow without the GUI."
+    )
+    parser.add_argument(
+        "--serial-last4",
+        default=DEFAULT_SERIAL_LAST4,
+        help="Last 4 characters of the MU adapter serial.",
+    )
+    parser.add_argument(
+        "--can-bitrate",
+        type=int,
+        default=DEFAULT_CAN_BITRATE,
+        help="CAN bitrate in kbit/s.",
+    )
+    parser.add_argument(
+        "--node",
+        type=int,
+        default=DEFAULT_NODE_ID,
+        help="MiControl CAN node ID.",
+    )
+    parser.add_argument(
+        "--desired-current",
+        type=int,
+        default=DEFAULT_DESIRED_CURRENT,
+        help="Controller current command used during acquisition.",
+    )
+    parser.add_argument(
+        "--spinup-seconds",
+        type=float,
+        default=DEFAULT_SPINUP_SECONDS,
+        help="Seconds to wait after applying current before the first acquisition.",
+    )
+    parser.add_argument(
+        "--samples",
+        type=int,
+        default=DEFAULT_SAMPLES,
+        help="Raw samples per acquisition.",
+    )
+    parser.add_argument(
+        "--frame-cycle-time-s",
+        type=float,
+        default=DEFAULT_FRAME_CYCLE_TIME_S,
+        help="Requested MU frame cycle time.",
+    )
+    parser.add_argument(
+        "--clock-frequency-hz",
+        type=float,
+        default=DEFAULT_CLOCK_FREQUENCY_HZ,
+        help="Requested MU clock frequency.",
+    )
+    parser.add_argument(
+        "--max-analog-runs",
+        type=int,
+        default=DEFAULT_MAX_ANALOG_RUNS,
+        help="Maximum analog adjustment acquisitions per calibration attempt.",
+    )
+    parser.add_argument(
+        "--residual-limit-lsb",
+        type=float,
+        default=DEFAULT_RESIDUAL_LIMIT_LSB,
+        help="Analog residual target used to stop the analog loop.",
+    )
+    parser.add_argument(
+        "--final-residual-cap-lsb",
+        type=float,
+        default=DEFAULT_FINAL_RESIDUAL_CAP_LSB,
+        help="Final acceptance cap for max_abs_analog_residual_lsb.",
+    )
+    parser.add_argument(
+        "--max-calibration-attempts",
+        type=int,
+        default=DEFAULT_MAX_CALIBRATION_ATTEMPTS,
+        help="Maximum full calibration attempts per encoder.",
+    )
+    parser.add_argument(
+        "--max-phase-margin-pct",
+        type=float,
+        default=DEFAULT_MAX_PHASE_MARGIN_PCT,
+        help="Maximum allowed nonius phase margin percent of the phase range limit.",
+    )
+    return parser.parse_args(argv)
+
+
 if __name__ == "__main__":
     restore_sigint = install_deferred_keyboard_interrupt(label="full calibration")
     try:
-        main(serial_last4="")
+        args = parse_args()
+        raise SystemExit(
+            0
+            if main(
+                serial_last4=args.serial_last4,
+                can_bitrate=args.can_bitrate,
+                node=args.node,
+                desired_current=args.desired_current,
+                spinup_seconds=args.spinup_seconds,
+                n_samples=args.samples,
+                frame_cycle_time_s=args.frame_cycle_time_s,
+                clock_frequency_hz=args.clock_frequency_hz,
+                max_analog_runs=args.max_analog_runs,
+                residual_limit_lsb=args.residual_limit_lsb,
+                final_residual_cap_lsb=args.final_residual_cap_lsb,
+                max_calibration_attempts=args.max_calibration_attempts,
+                max_phase_margin_pct=args.max_phase_margin_pct,
+            )
+            else 1
+        )
     finally:
         restore_sigint()

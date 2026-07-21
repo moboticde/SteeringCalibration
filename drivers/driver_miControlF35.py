@@ -41,7 +41,17 @@ class MicontrolF35_CAN:
         """Automatically adds nodes for MiControl CAN when the class is initialized."""
         if self.node_id is not None:
             node_value = int(self.node_id)  # Convert to int
-            added_node = self.can.add_node(node_value, self.eds)
+            try:
+                added_node = self.can.add_node(node_value, self.eds)
+            except UnicodeDecodeError as e:
+                print(
+                    f"[ERROR] Could not load MiControlF35 EDS file {self.eds}: "
+                    f"{e}. Replace it with a UTF-8 compatible EDS."
+                )
+                return None
+            except Exception as e:
+                print(f"[ERROR] Failed to create MiControlF35 CAN node {node_value}: {e}")
+                return None
             probes = (
                 (0x1000, 0x00, "device type"),
                 (0x2000, 0x02, "node id parameter"),
@@ -345,7 +355,15 @@ class MicontrolF35_CAN:
         controller_MPUNr = self.added_node.sdo.upload(0x5101, 0x02)
         return int.from_bytes(controller_MPUNr, byteorder='little', signed=True)
 
-    def set_velocity_mode(self):
+    def set_velocity_mode(self): 
+        if self.added_node:
+            try:
+                self.added_node.sdo.download(0x3003,0, b'\x03\x00\x00\x00')
+                #print(f"[INFO] Node {self.node_id}: Velocity mode enabled.")
+            except Exception as e:
+                print(f"[ERROR] Failed to set velocity mode for node {self.node_id}: {e}")
+    
+    def set_s_velocity_mode(self):
         if self.added_node:
             try:
                 self.added_node.sdo.download(0x3003,0, b'\x05\x00\x00\x00')

@@ -82,6 +82,12 @@ def return_controller_to_zero(mic: Any, rpm: int) -> None:
     initial_pos = mic.get_steering_pos()
     print(f"[INFO] Controller steering position before zero return: {initial_pos}")
 
+    if hasattr(mic, "restore_extended_ssi_mode"):
+        try:
+            mic.restore_extended_ssi_mode()
+        except Exception as exc:
+            print(f"[WARN] Failed to restore extended SSI before zero return: {exc}")
+
     mic.clear_errors()
     mic.clear_errors()
     if mic.SSI_encoder(True):
@@ -102,10 +108,20 @@ def return_controller_to_zero(mic: Any, rpm: int) -> None:
 
     print("[STATUS] Returning controller to steering position 0 after test calibration.")
 
-    mic.set_device_mode_position()
-    mic.set_RPM(rpm)
-    mic.set_steering_RPM(rpm)
-    mic.enabled(True)
+    if hasattr(mic, "prepare_position_motion"):
+        if not mic.prepare_position_motion(rpm):
+            mode = mic.get_device_mode() if hasattr(mic, "get_device_mode") else None
+            error = mic.get_error_code() if hasattr(mic, "get_error_code") else None
+            position = mic.get_steering_pos() if hasattr(mic, "get_steering_pos") else None
+            raise RuntimeError(
+                "Controller is not ready for zero-return position commands: "
+                f"mode={mode} error={error} steering_position={position}."
+            )
+    else:
+        mic.set_device_mode_position()
+        mic.set_RPM(rpm)
+        mic.set_steering_RPM(rpm)
+        mic.enabled(True)
     try:
         mic.set_steering_pos(0)
     except Exception as exc:
@@ -113,6 +129,9 @@ def return_controller_to_zero(mic: Any, rpm: int) -> None:
         if start_pos is None:
             raise
         print(f"[STATUS] Trying relative zero return by {-int(start_pos)} counts.")
+        mic.clear_errors()
+        if hasattr(mic, "prepare_position_motion") and not mic.prepare_position_motion(rpm):
+            raise RuntimeError("Controller is not ready for relative zero-return command.") from exc
         mic.set_steering_relative(-int(start_pos))
 
     deadline = time.monotonic() + ZERO_RETURN_TIMEOUT_S
@@ -423,10 +442,6 @@ def main(
             if restarted_can and restarted_mic:
                 can, mic = restarted_can, restarted_mic
                 print("[INFO] Controller restarted after test calibration.")
-                try:
-                    return_controller_to_zero(mic, rpm=rpm)
-                except Exception as exc:
-                    print(f"[WARN] Failed to return controller to zero after test calibration: {exc}")
             else:
                 print("[WARN] Controller restart after test calibration did not complete.")
         except Exception as exc:

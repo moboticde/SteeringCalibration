@@ -27,7 +27,7 @@ ANGLE_SAMPLES = 20
 ANGLE_TIMEOUT_S = 20.0
 ANGLE_READ_ATTEMPTS = 2
 CONF_REQUIRED_COLUMNS = ("Serial number", "Configuration", "Write Zero", "Calibration")
-CONF_REQUIRED_OK_SEQUENCE = ("Calibration", "Write Zero", "Configuration")
+CONF_REQUIRED_OK_SEQUENCE = ("Configuration", "Write Zero", "Calibration")
 
 
 class TestRunner:
@@ -139,8 +139,9 @@ class TestRunner:
 
     def verify_configuration_processes_done(self):
         """
-        Confirm that the latest calibration status row has a serial number and
-        Calibration, Write Zero, and Configuration are all OK.
+        Confirm that Configuration, Write Zero, and Calibration are OK in order.
+        The OK values may be written in different rows when the production steps
+        are completed in separate GUI sessions.
         """
         path, df = self._read_conf_status_sheet()
         missing = [column for column in CONF_REQUIRED_COLUMNS if column not in df.columns]
@@ -157,22 +158,31 @@ class TestRunner:
                 f"Workbook: {path}"
             )
 
-        latest_row = status_rows.iloc[-1]
-        serial_value = latest_row.get("Serial number", "")
-        serial = "" if pd.isna(serial_value) else str(serial_value).strip()
-        if serial and serial != "-" and all(
-            self._conf_status_ok(latest_row.get(column))
-            for column in CONF_REQUIRED_OK_SEQUENCE
-        ):
+        completed_step = 0
+        serial = ""
+        for _idx, row in status_rows.iterrows():
+            serial_value = row.get("Serial number", "")
+            row_serial = "" if pd.isna(serial_value) else str(serial_value).strip()
+            if row_serial and row_serial != "-":
+                serial = row_serial
+            if completed_step == 0 and self._conf_status_ok(row.get("Configuration")):
+                completed_step = 1
+            if completed_step == 1 and self._conf_status_ok(row.get("Write Zero")):
+                completed_step = 2
+            if completed_step == 2 and self._conf_status_ok(row.get("Calibration")):
+                completed_step = 3
+                break
+
+        if serial and completed_step == len(CONF_REQUIRED_OK_SEQUENCE):
             print(f"[INFO] Configuration status verified for serial number {serial}: {path}")
             return True
 
         summary_columns = ["Serial number", *CONF_REQUIRED_OK_SEQUENCE]
-        summary = latest_row[summary_columns].fillna("-").to_frame().T.to_string(index=False)
+        summary = status_rows[summary_columns].fillna("-").tail(5).to_string(index=False)
         raise RuntimeError(
-            "Configuration process is not complete. The latest row in the 'conf' sheet must "
-            "have a serial number and Calibration, Write Zero, and Configuration all OK. "
-            f"Workbook: {path}\nLatest row:\n{summary}"
+            "Configuration process is not complete. The 'conf' sheet must show "
+            "Configuration OK, then Write Zero OK, then Calibration OK, and contain a "
+            f"serial number. Workbook: {path}\nRecent rows:\n{summary}"
         )
 
     def _read_camera_angle_deg(self, context):
@@ -472,10 +482,6 @@ class TestRunner:
             except Exception as exc:
                 print(f"[WARN] Failed to restart controller after TestCalibration: {exc}")
             try:
-                TestCalibration.return_controller_to_zero(self.controller, rpm=rpm)
-            except Exception as exc:
-                print(f"[WARN] Failed to return controller to zero after TestCalibration: {exc}")
-            try:
                 self.controller.set_RPM(0)
             except Exception:
                 pass
@@ -519,8 +525,11 @@ class TestRunner:
                 "Product Specification": round(float(zero_spec), 2),
                 "Tolerance": f"+/-{float(tolerance_deg):.2f} deg",
                 "Difference": round(float(visual_error), 2),
-                "Match": bool(visual_ok),
-                "Details": "",
+                "Match": "Info",
+                "Details": (
+                    "Camera angle is recorded for reference only; "
+                    "EOL pass/fail uses the controller zero position."
+                ),
             })
 
             print(
@@ -830,7 +839,11 @@ class TestRunner:
                         "Steering EOL stopped because calibration quality failed. "
                         "See the 'calibration' sheet and test_calibration_report files; "
                         "position and motor tests were not run."
-                    )
+                )
+                TestCalibration = importlib.import_module("tests.TestCalibration")
+                TestCalibration.return_controller_to_zero(self.controller, rpm=ZERO_MOVE_RPM)
+                
+                time.sleep(2.0)
 
                 # Steering APP test: position control feedback
                 app_results = self.steering_app_test(info["position"])

@@ -3,7 +3,7 @@ import os
 from pathlib import Path
 import numpy as np
 import pandas as pd
-from io_helpers.find_product_folder import find_config
+from io_helpers import find_product_folder
 from openpyxl import load_workbook
 import zipfile
 import warnings  
@@ -45,6 +45,42 @@ def find_product_spec_v2(product_dir):
     )
 
 
+def _normalized_product_key(value):
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def _configured_product_base_path():
+    config_data = getattr(find_product_folder, "config", None)
+    if not isinstance(config_data, dict):
+        return None
+    paths = config_data.get("paths", {})
+    if not isinstance(paths, dict):
+        return None
+    product_base = paths.get("product_base")
+    return Path(product_base) if product_base else None
+
+
+def resolve_product_family_dir(qr_code, product_dir_raw):
+    product_dir = Path(product_dir_raw).expanduser().resolve()
+    product_base = _configured_product_base_path()
+    if product_base is None:
+        return product_dir
+
+    base_dir = product_base.expanduser().resolve()
+    try:
+        relative_parts = product_dir.relative_to(base_dir).parts
+    except ValueError:
+        return product_dir
+
+    if not relative_parts:
+        return product_dir
+
+    family_dir = base_dir / relative_parts[0]
+    if _normalized_product_key(qr_code).startswith(_normalized_product_key(family_dir.name)):
+        return family_dir
+    return product_dir
+
+
 def resolve_product_spec_from_scan(scan_text):
     text = str(scan_text or "").strip()
     if not text:
@@ -57,7 +93,7 @@ def resolve_product_spec_from_scan(scan_text):
     else:
         old_cwd = os.getcwd()
         try:
-            product_dir_raw = find_config(text)
+            product_dir_raw = find_product_folder.find_config(text)
         finally:
             try:
                 os.chdir(old_cwd)
@@ -65,10 +101,10 @@ def resolve_product_spec_from_scan(scan_text):
                 pass
         if not product_dir_raw:
             raise FileNotFoundError(f"[ERROR] No matching folder found for QR code: {text}")
-        product_dir = Path(product_dir_raw)
+        product_dir = resolve_product_family_dir(text, product_dir_raw)
 
     spec_path = find_product_spec_v2(product_dir)
-    return spec_path.parent, spec_path
+    return product_dir, spec_path
 
 
 class ConfigReader:

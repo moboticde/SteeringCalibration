@@ -32,7 +32,6 @@ def _load_full_calibration_with_fake_hardware():
         "drivers.driver_cam_st",
         "drivers.driver_mc",
         "drivers.driver_miControlF35",
-        "drivers.driver_owon",
         "logic.FlashSteeringScript",
         "utils.config_processing",
         "utils.interrupt_guard",
@@ -59,10 +58,6 @@ def _load_full_calibration_with_fake_hardware():
         driver_micontrol = types.ModuleType("drivers.driver_miControlF35")
         driver_micontrol.MicontrolF35_CAN = type("MicontrolF35_CAN", (), {})
         sys.modules["drivers.driver_miControlF35"] = driver_micontrol
-
-        driver_owon = types.ModuleType("drivers.driver_owon")
-        driver_owon.power_cycle_owon_spe6053 = lambda **_kwargs: False
-        sys.modules["drivers.driver_owon"] = driver_owon
 
         steering_script = types.ModuleType("logic.FlashSteeringScript")
         steering_script.import_script_via_qr = lambda: None
@@ -431,7 +426,69 @@ class FullCalibrationProtectionTests(unittest.TestCase):
         self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFD14EDC), calls)
         self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFCF4EDC), calls)
 
-    def test_restart_controller_uses_owon_power_cycle(self):
+    def test_parse_args_defaults_to_node_50_and_125_kbit(self):
+        args = fc.parse_args([])
+
+        self.assertEqual(args.serial_last4, "")
+        self.assertEqual(args.can_bitrate, 125)
+        self.assertEqual(args.node, 50)
+        self.assertEqual(args.desired_current, 3000)
+        self.assertEqual(args.spinup_seconds, 60.0)
+        self.assertEqual(args.samples, 64000)
+        self.assertEqual(args.max_calibration_attempts, 2)
+        self.assertEqual(args.max_phase_margin_pct, 50.0)
+
+    def test_parse_args_exposes_standalone_calibration_cli(self):
+        args = fc.parse_args([
+            "--serial-last4", "A123",
+            "--can-bitrate", "250",
+            "--node", "59",
+            "--desired-current", "3200",
+            "--spinup-seconds", "10",
+            "--samples", "32000",
+            "--frame-cycle-time-s", "0.0002",
+            "--clock-frequency-hz", "1000000",
+            "--max-analog-runs", "4",
+            "--residual-limit-lsb", "0.8",
+            "--final-residual-cap-lsb", "12",
+            "--max-calibration-attempts", "3",
+            "--max-phase-margin-pct", "55",
+        ])
+
+        self.assertEqual(args.serial_last4, "A123")
+        self.assertEqual(args.can_bitrate, 250)
+        self.assertEqual(args.node, 59)
+        self.assertEqual(args.desired_current, 3200)
+        self.assertEqual(args.spinup_seconds, 10.0)
+        self.assertEqual(args.samples, 32000)
+        self.assertEqual(args.frame_cycle_time_s, 0.0002)
+        self.assertEqual(args.clock_frequency_hz, 1000000.0)
+        self.assertEqual(args.max_analog_runs, 4)
+        self.assertEqual(args.residual_limit_lsb, 0.8)
+        self.assertEqual(args.final_residual_cap_lsb, 12.0)
+        self.assertEqual(args.max_calibration_attempts, 3)
+        self.assertEqual(args.max_phase_margin_pct, 55.0)
+
+    def test_load_mu_config_calls_sdk_load_params(self):
+        calls: list[str] = []
+
+        original_load_params = fc.mu.MU_LoadParams
+        try:
+            def fake_load_params(_handle, config_path):
+                calls.append(config_path.decode("utf-8"))
+                return fc.MU_OK
+
+            fc.mu.MU_LoadParams = fake_load_params
+
+            self.assertTrue(
+                fc._load_mu_config(fc.MU_Handle(), Path("/tmp/original.cfg"))
+            )
+        finally:
+            fc.mu.MU_LoadParams = original_load_params
+
+        self.assertEqual(calls, ["/tmp/original.cfg"])
+
+    def test_restart_controller_uses_power_cycle_callback_before_nmt(self):
         calls: list[tuple[str, object]] = []
 
         class FakeCan:
@@ -457,12 +514,62 @@ class FullCalibrationProtectionTests(unittest.TestCase):
             def clear_errors(self):
                 calls.append(("clear_errors", True))
 
-        original_power_cycle = fc.power_cycle_owon_spe6053
         original_nmt_reset = fc.nmt_reset_node_compat
         original_driver_can = fc.DriverCan
         original_micontrol = fc.MicontrolF35_CAN
         try:
-            fc.power_cycle_owon_spe6053 = lambda **kwargs: calls.append(("power_cycle", kwargs)) or True
+            fc.nmt_reset_node_compat = lambda _nmt: calls.append(("nmt_reset", True))
+            fc.DriverCan = NewCan
+            fc.MicontrolF35_CAN = NewController
+
+            new_can, new_mic = fc.restart_controller(
+                can=FakeCan(),
+                mic=FakeController(),
+                node=50,
+                can_bitrate=125,
+                power_cycle_wait_fn=lambda timeout_s: calls.append(("manual_wait", timeout_s)) or True,
+            )
+        finally:
+            fc.nmt_reset_node_compat = original_nmt_reset
+            fc.DriverCan = original_driver_can
+            fc.MicontrolF35_CAN = original_micontrol
+
+        self.assertIsInstance(new_can, NewCan)
+        self.assertIsInstance(new_mic, NewController)
+        self.assertIn(("manual_wait", 600.0), calls)
+        self.assertNotIn(("nmt_reset", True), calls)
+        self.assertIn(("close_can", True), calls)
+
+    def test_restart_controller_uses_nmt_reset_without_power_cycle_callback(self):
+        calls: list[tuple[str, object]] = []
+
+        class FakeCan:
+            def close_can(self):
+                calls.append(("close_can", True))
+
+        class FakeNode:
+            nmt = object()
+
+        class FakeController:
+            added_node = FakeNode()
+
+        class NewCan:
+            def __init__(self, can_bitrate):
+                calls.append(("new_can_bitrate", can_bitrate))
+                self.can_network = object()
+
+        class NewController:
+            def __init__(self, can, node):
+                calls.append(("new_controller_node", node))
+                self.added_node = object()
+
+            def clear_errors(self):
+                calls.append(("clear_errors", True))
+
+        original_nmt_reset = fc.nmt_reset_node_compat
+        original_driver_can = fc.DriverCan
+        original_micontrol = fc.MicontrolF35_CAN
+        try:
             fc.nmt_reset_node_compat = lambda _nmt: calls.append(("nmt_reset", True))
             fc.DriverCan = NewCan
             fc.MicontrolF35_CAN = NewController
@@ -474,21 +581,13 @@ class FullCalibrationProtectionTests(unittest.TestCase):
                 can_bitrate=125,
             )
         finally:
-            fc.power_cycle_owon_spe6053 = original_power_cycle
             fc.nmt_reset_node_compat = original_nmt_reset
             fc.DriverCan = original_driver_can
             fc.MicontrolF35_CAN = original_micontrol
 
         self.assertIsInstance(new_can, NewCan)
         self.assertIsInstance(new_mic, NewController)
-        self.assertIn(
-            (
-                "power_cycle",
-                {"off_seconds": 3.0, "voltage_v": 24.0, "current_a": 5.0},
-            ),
-            calls,
-        )
-        self.assertNotIn(("nmt_reset", True), calls)
+        self.assertIn(("nmt_reset", True), calls)
         self.assertIn(("close_can", True), calls)
         self.assertIn(("clear_errors", True), calls)
 
