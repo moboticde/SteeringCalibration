@@ -24,6 +24,19 @@ def _write_product_files(product_dir: Path) -> None:
     (script_dir / "SteeringScript.py").write_text("# test steering script\n", encoding="utf-8")
 
 
+def _write_eol_recipe_files(product_dir: Path, *names: str) -> None:
+    recipe_names = names or (
+        "TractionRecepie.xlsx",
+        "SteeringAppRecepie.xlsx",
+        "SteeringMotorRecepie.xlsx",
+    )
+    for name in recipe_names:
+        gui.write_conf_xlsx_rows(
+            product_dir / "02_EOL_Recepies" / name,
+            [["setpoint", "time", "position"], [100, 1, 0]],
+        )
+
+
 def test_resolve_product_family_dir_uses_top_level_product_folder(tmp_path):
     family_dir = tmp_path / "SO-1000"
     unit_dir = family_dir / "SO-1000-284"
@@ -137,6 +150,27 @@ def test_non_steering_product_spec_disables_steering(tmp_path, monkeypatch):
     assert result.context is None
     assert result.steering_available is False
     assert "Steering tab disabled" in result.message
+
+
+def test_product_scan_without_folder_registers_traction_only_product(tmp_path, monkeypatch):
+    product_number = "99038922252125052947221126788"
+
+    monkeypatch.setattr(find_product_folder, "find_config", lambda _qr_code: "")
+    monkeypatch.setattr(find_product_folder, "config", {})
+    monkeypatch.setattr(gui, "MANUFACTURING_ROOT", tmp_path / "Manufacturing")
+
+    result = gui.resolve_product_scan_text(product_number)
+
+    assert result.qr_code == product_number
+    assert result.product_dir is None
+    assert result.spec_path is None
+    assert result.context is None
+    assert result.steering_available is False
+    assert "traction calibration can use the product number" in result.message
+    assert gui.traction_calibration_status_for_product(result.qr_code) == (
+        True,
+        "Traction calibration available.",
+    )
 
 
 def test_default_can_check_tries_standard_and_spec_nodes_before_failure(monkeypatch):
@@ -268,6 +302,139 @@ def test_eol_sequence_accepts_required_steps_across_rows_in_order():
     assert status["start_calibration"]["time"] == "2026-07-10 12:00:00"
 
 
+def test_prepared_steering_product_is_eol_eligible_in_gui_snapshot(tmp_path):
+    product_dir = tmp_path / "SO-1000"
+    barcode = "SO-1000-284"
+    _write_eol_recipe_files(product_dir)
+    gui.write_conf_xlsx_rows(
+        gui.status_workbook_path_for_qr(product_dir, barcode),
+        [
+            list(gui.RUN_ALL_REPORT_COLUMNS),
+            ["2026-07-10 10:00:00", "SN123", "OK", "-", "-"],
+            ["2026-07-10 11:00:00", "SN123", "-", "OK", "-"],
+            ["2026-07-10 12:00:00", "SN123", "-", "-", "OK"],
+        ],
+    )
+
+    previous = {
+        "current_barcode": gui.STATE.current_barcode,
+        "current_product_dir": gui.STATE.current_product_dir,
+        "steering_available": gui.STATE.steering_available,
+        "product_scan_completed": gui.STATE.product_scan_completed,
+        "relay_arduino": gui.STATE.relay_arduino,
+    }
+    try:
+        gui.STATE.current_barcode = barcode
+        gui.STATE.current_product_dir = product_dir
+        gui.STATE.steering_available = True
+        gui.STATE.product_scan_completed = True
+        gui.STATE.relay_arduino = None
+
+        snapshot = gui.STATE.snapshot()
+    finally:
+        for name, value in previous.items():
+            setattr(gui.STATE, name, value)
+
+    assert snapshot["eol_available"] is True
+    assert "EOL enabled" in snapshot["eol_status_message"]
+    assert snapshot["eol_status_path"].endswith(f"{barcode}_status.xlsx")
+    assert snapshot["conf_workflow_status"]["load_script_config"]["state"] == "pass"
+    assert snapshot["conf_workflow_status"]["start_zeroing"]["state"] == "pass"
+    assert snapshot["conf_workflow_status"]["start_calibration"]["state"] == "pass"
+
+
+def test_non_steering_product_with_eol_recipes_is_eol_eligible_without_steering_status(tmp_path):
+    product_dir = tmp_path / "DD-RR-500"
+    barcode = "DD-RR-500-001"
+    spec_path = product_dir / "ProductSpecifications_V2.xlsx"
+    gui.write_conf_xlsx_rows(
+        spec_path,
+        [
+            ["CAN Baudrate", 125],
+            ["Communication", "CAN"],
+            ["Traction Controller Type", "MiControl F35"],
+            ["Traction Node ID", 12],
+        ],
+    )
+    _write_eol_recipe_files(product_dir, "TractionRecepie.xlsx")
+
+    previous = {
+        "current_barcode": gui.STATE.current_barcode,
+        "current_product_dir": gui.STATE.current_product_dir,
+        "current_product_spec_path": gui.STATE.current_product_spec_path,
+        "current_product_params": dict(gui.STATE.current_product_params),
+        "current_product_context": gui.STATE.current_product_context,
+        "steering_available": gui.STATE.steering_available,
+        "product_scan_completed": gui.STATE.product_scan_completed,
+        "relay_arduino": gui.STATE.relay_arduino,
+    }
+    try:
+        gui.STATE.current_barcode = barcode
+        gui.STATE.current_product_dir = product_dir
+        gui.STATE.current_product_spec_path = spec_path
+        gui.STATE.current_product_params = gui.read_product_spec_parameters(spec_path)
+        gui.STATE.current_product_context = None
+        gui.STATE.steering_available = False
+        gui.STATE.product_scan_completed = True
+        gui.STATE.relay_arduino = None
+
+        snapshot = gui.STATE.snapshot()
+    finally:
+        for name, value in previous.items():
+            setattr(gui.STATE, name, value)
+
+    assert snapshot["eol_available"] is True
+    assert "product specification and recipes found" in snapshot["eol_status_message"]
+
+
+def test_eol_eligibility_reports_missing_recipe_files(tmp_path):
+    product_dir = tmp_path / "DD-RR-500"
+    spec_path = product_dir / "ProductSpecifications_V2.xlsx"
+    gui.write_conf_xlsx_rows(
+        spec_path,
+        [
+            ["Traction Controller Type", "MiControl F35"],
+            ["Traction Node ID", 12],
+        ],
+    )
+    params = gui.read_product_spec_parameters(spec_path)
+
+    ok, message, path = gui.eol_availability_status_for_product(
+        product_dir,
+        "DD-RR-500-001",
+        spec_path,
+        params,
+        False,
+    )
+
+    assert ok is False
+    assert "recipe folder not found" in message
+    assert path.endswith("02_EOL_Recepies")
+
+
+def test_run_eol_accepts_non_so_product_barcode(monkeypatch):
+    captured: dict[str, object] = {}
+
+    def fake_run_mobotic_eol(**kwargs):
+        captured.update(kwargs)
+        return True
+
+    monkeypatch.setattr(gui, "run_mobotic_eol", fake_run_mobotic_eol)
+
+    assert gui.run_task(
+        "run_eol",
+        {
+            "tester_name": "Tester",
+            "product_barcode": "DD-RR-500-001",
+            "motor_barcode": "MOTOR-001",
+        },
+    ) is True
+
+    assert captured["unit_serial_number"] == "DD-RR-500-001"
+    assert captured["motor_number"] == "MOTOR-001"
+    assert captured["tester_name"] == "Tester"
+
+
 def test_eol_done_workbook_is_reported_as_last_report(tmp_path):
     product_dir = tmp_path / "SO-1000"
     done_path = gui.done_workbook_path_for_qr(product_dir, "SO-1000-284")
@@ -296,8 +463,9 @@ def test_eol_sequence_rejects_calibration_before_zero_without_later_calibration(
     assert "Calibration" in message
 
 
-def test_traction_calibration_script_selection_uses_dd_numbers_only():
+def test_traction_calibration_script_selection_uses_product_number_markers_only():
     assert gui.choose_traction_calibration_script("motor BL167/25_SB extra").name == "ST_Calibration.py"
+    assert gui.choose_traction_calibration_script("99038922252125052947221126788").name == "DD_Calibration.py"
     assert gui.choose_traction_calibration_script("1126788").name == "DD_Calibration.py"
     assert gui.choose_traction_calibration_script("part bl167/25").name == "ST_Calibration.py"
     assert gui.choose_traction_calibration_script("1058534").name == "DD_Calibration.py"
@@ -658,6 +826,44 @@ SinOff: 0 | CosOff: 0 | GainC: 0 | Harm4: 0 | RPM: 100
     assert gui.parse_attempt_9_calibration_zero(missing_output) == (False, None)
 
 
+def test_traction_mhm_interface_diagnostic_reports_expected_usb_ids():
+    output = """
+RuntimeError: Failed to set interface. Tried: mb5u: eMHM_INTERFACE_NOT_FOUND (3); mb4u: eMHM_INTERFACE_NOT_FOUND (3); mb3u-biss: eMHM_INTERFACEDRIVER_NOT_FOUND (2)
+"""
+    lsusb_output = """
+Bus 001 Device 083: ID 1d50:606f OpenMoko, Inc. Geschwister Schneider CAN adapter
+Bus 001 Device 084: ID 2341:003e Arduino SA Due
+"""
+
+    diagnostic = gui.traction_mhm_interface_diagnostic(output, lsusb_output)
+
+    assert "MHM interface setup failed" in diagnostic
+    assert "MB5U 1ae4:3101" in diagnostic
+    assert "MB4U 1ae4:0003" in diagnostic
+    assert "MB3U/FTDI iC-Haus 0403:6010" in diagnostic
+    assert "No expected MHM adapter USB ID was found" in diagnostic
+
+
+def test_traction_mhm_biss_comm_diagnostic_reports_open_adapter_comm_failure():
+    output = """
+Interface MB5U opened.
+Successfully set to BiSS mode using 'switch'.
+RuntimeError: Initialization failed: eMHM_BISSCOMM_FAILED (13); last error: eMHM_BISSCOMM_FAILED (13), type 5: Check adapter to iC-MHM connection. Check power supply.
+"""
+    lsusb_output = """
+Bus 001 Device 084: ID 1ae4:3101 iC-Haus GmbH MB5U
+"""
+
+    assert gui.traction_mhm_biss_comm_failure_detected(output) is True
+
+    diagnostic = gui.traction_mhm_interface_diagnostic(output, lsusb_output)
+
+    assert "MHM BiSS communication failed" in diagnostic
+    assert "adapter/interface opened" in diagnostic
+    assert "adapter-to-iC-MHM wiring" in diagnostic
+    assert "Detected expected MHM adapter(s): MB5U 1ae4:3101" in diagnostic
+
+
 def test_append_traction_calibration_log_creates_and_appends_rows(tmp_path):
     workbook = tmp_path / "Calibration.xlsx"
 
@@ -683,6 +889,31 @@ def test_append_traction_calibration_log_creates_and_appends_rows(tmp_path):
     ]
 
 
+def test_append_traction_calibration_log_migrates_legacy_motor_header(tmp_path):
+    workbook = tmp_path / "Calibration.xlsx"
+    gui.write_conf_xlsx_rows(
+        workbook,
+        [
+            list(gui.LEGACY_TRACTION_CALIBRATION_COLUMNS),
+            ["2026-07-09 12:00:00", "OLD", "ST", "PASS"],
+        ],
+    )
+
+    gui.append_traction_calibration_log(
+        workbook_path=workbook,
+        calibration_date="2026-07-09 12:05:00",
+        barcode="99038922252125052947221126788",
+        program="DD",
+        status="PASS",
+    )
+
+    assert gui.read_conf_xlsx_rows(workbook) == [
+        list(gui.TRACTION_CALIBRATION_COLUMNS),
+        ["2026-07-09 12:00:00", "OLD", "ST", "PASS"],
+        ["2026-07-09 12:05:00", "99038922252125052947221126788", "DD", "PASS"],
+    ]
+
+
 def test_run_traction_calibration_logs_fail_on_subprocess_error(tmp_path, monkeypatch):
     calibration_root = tmp_path / "TrCalibration"
     calibration_root.mkdir()
@@ -699,9 +930,17 @@ SinOff: 0 | CosOff: 0 | GainC: 0 | Harm4: 0 | RPM: 100
 
     monkeypatch.setattr(gui, "TRACTION_CALIBRATION_ROOT", calibration_root)
     monkeypatch.setattr(gui, "TRACTION_CALIBRATION_WORKBOOK", workbook)
-    monkeypatch.setattr(gui.subprocess, "run", lambda *_args, **_kwargs: Completed())
+    run_calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    def fake_run(*args, **kwargs):
+        run_calls.append((args, kwargs))
+        return Completed()
+
+    monkeypatch.setattr(gui.subprocess, "run", fake_run)
 
     assert gui.run_traction_calibration("1126788") is False
+    assert run_calls
+    assert run_calls[0][1]["env"]["MHM_INTERFACE"] == "auto"
     assert gui.read_conf_xlsx_rows(workbook)[1] == [
         gui.read_conf_xlsx_rows(workbook)[1][0],
         "1126788",
@@ -717,7 +956,54 @@ def test_scan_option_parser_accepts_known_options():
     assert gui.parse_scan_option("manual") == "manual"
 
 
-def test_changing_scan_option_resets_cached_scan_and_prompts_again():
+def test_qr_camera_scan_option_waits_for_explicit_rescan(monkeypatch):
+    state = gui.STATE
+    started: list[tuple[object, object]] = []
+
+    class FakeThread:
+        def __init__(self, target, args=(), daemon=None):
+            self.target = target
+            self.args = args
+            self.daemon = daemon
+
+        def start(self):
+            started.append((self.target, self.args))
+
+    original_values = {
+        "scan_option": state.scan_option,
+        "relay_connection_ok": state.relay_connection_ok,
+        "product_scan_running": state.product_scan_running,
+        "product_scan_completed": state.product_scan_completed,
+        "awaiting_product_scan": state.awaiting_product_scan,
+        "product_scan_message": state.product_scan_message,
+        "steering_available": state.steering_available,
+        "current_product_context": state.current_product_context,
+        "current_product_params": state.current_product_params,
+        "current_product_spec_path": state.current_product_spec_path,
+        "current_product_dir": state.current_product_dir,
+        "current_barcode": state.current_barcode,
+        "current_report": state.current_report,
+    }
+    try:
+        monkeypatch.setattr(gui.threading, "Thread", FakeThread)
+        state.scan_option = "manual"
+        state.relay_connection_ok = True
+        state.product_scan_running = False
+        state.product_scan_completed = False
+        state.awaiting_product_scan = True
+
+        state.set_scan_option(gui.SCAN_OPTION_QR_CAMERA)
+
+        assert state.scan_option == gui.SCAN_OPTION_QR_CAMERA
+        assert state.awaiting_product_scan is False
+        assert state.product_scan_message == "Scan option set. Click Rescan to scan product code."
+        assert started == []
+    finally:
+        for key, value in original_values.items():
+            setattr(state, key, value)
+
+
+def test_changing_scan_option_keeps_cached_scan_until_rescan():
     state = gui.STATE
     original_values = {
         "scan_option": state.scan_option,
@@ -747,11 +1033,75 @@ def test_changing_scan_option_resets_cached_scan_and_prompts_again():
         state.set_scan_option("manual")
 
         assert state.scan_option == "manual"
+        assert state.product_scan_completed is True
+        assert state.awaiting_product_scan is False
+        assert state.steering_available is True
+        assert state.current_barcode == "SO-1000-284"
+        assert state.current_product_params == {"Steering Node ID": 50}
+    finally:
+        for key, value in original_values.items():
+            setattr(state, key, value)
+
+
+def test_prepare_product_rescan_resets_cached_scan_and_prompts_for_manual():
+    state = gui.STATE
+    original_values = {
+        "scan_option": state.scan_option,
+        "relay_connection_ok": state.relay_connection_ok,
+        "product_scan_running": state.product_scan_running,
+        "product_scan_completed": state.product_scan_completed,
+        "awaiting_product_scan": state.awaiting_product_scan,
+        "product_scan_message": state.product_scan_message,
+        "product_scan_error": state.product_scan_error,
+        "steering_available": state.steering_available,
+        "current_product_context": state.current_product_context,
+        "current_product_params": state.current_product_params,
+        "current_product_spec_path": state.current_product_spec_path,
+        "current_product_dir": state.current_product_dir,
+        "current_barcode": state.current_barcode,
+        "current_report": state.current_report,
+        "manual_can": state.manual_can,
+        "manual_mic": state.manual_mic,
+        "can_connection_ok": state.can_connection_ok,
+        "can_connection_message": state.can_connection_message,
+        "running": state.running,
+        "can_check_running": state.can_check_running,
+        "manual_requests_in_flight": state.manual_requests_in_flight,
+    }
+    fake_can = object()
+    try:
+        state.scan_option = "qr_camera"
+        state.relay_connection_ok = True
+        state.product_scan_running = False
+        state.product_scan_completed = True
+        state.awaiting_product_scan = False
+        state.product_scan_error = "old error"
+        state.steering_available = True
+        state.current_barcode = "SO-1000-284"
+        state.current_product_params = {"Steering Node ID": 50}
+        state.manual_can = fake_can
+        state.manual_mic = object()
+        state.can_connection_ok = True
+        state.running = False
+        state.can_check_running = False
+        state.manual_requests_in_flight = 0
+
+        ok, error, can_to_close = state.prepare_product_rescan("manual", awaiting_input=True)
+
+        assert ok is True
+        assert error == ""
+        assert can_to_close is fake_can
+        assert state.scan_option == "manual"
         assert state.product_scan_completed is False
         assert state.awaiting_product_scan is True
+        assert state.product_scan_error == ""
+        assert state.product_scan_message == "Scan product code."
         assert state.steering_available is None
         assert state.current_barcode == ""
         assert state.current_product_params == {}
+        assert state.manual_can is None
+        assert state.manual_mic is None
+        assert state.can_connection_ok is False
     finally:
         for key, value in original_values.items():
             setattr(state, key, value)

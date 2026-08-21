@@ -2195,9 +2195,7 @@ def write_just_conf(mu: ctypes.CDLL, handle: MU_Handle, mic, serial_last4) -> bo
             return False
 
         try:
-            ret = mu.MU_SetInterface(handle, MU_MB5U.value, serial_arg)
-            _log_mu("Set Interface", ret, handle)
-            if ret != MU_OK:
+            if not _set_mb5u_interface(handle, serial_arg):
                 return False
 
             ret = mu.MU_UseRevision(handle, MU_FORCED_REV)

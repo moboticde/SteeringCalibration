@@ -63,6 +63,12 @@ class DriverCan:
             )
         return result.stdout
 
+    def _socketcan_link_is_up(self, status):
+        first_line = status.splitlines()[0] if status.splitlines() else ""
+        flags_match = re.search(r"<([^>]*)>", first_line)
+        flags = set(flags_match.group(1).split(",")) if flags_match else set()
+        return "UP" in flags or re.search(r"\bstate\s+UP\b", first_line) is not None
+
     def ensure_socketcan_bitrate(self):
         """Ensure socketcan is configured to the requested bitrate before CANopen starts."""
         status = self._socketcan_status()
@@ -71,7 +77,24 @@ class DriverCan:
         if current_bitrate == 0 and "clock 0" in status:
             return
         if current_bitrate == self.can_bitrate:
-            return
+            if self._socketcan_link_is_up(status):
+                return
+            result = self._run_ip("link", "set", self.channel, "up")
+            if result.returncode != 0:
+                detail = (result.stderr or result.stdout).strip()
+                raise RuntimeError(
+                    f"CAN interface {self.channel} bitrate is {current_bitrate}, "
+                    "but the link is down. Could not bring it up automatically: "
+                    f"{detail or 'unknown error'}. "
+                    f"Run: sudo ip link set {self.channel} up"
+                )
+            status = self._socketcan_status()
+            if self._socketcan_link_is_up(status):
+                return
+            raise RuntimeError(
+                f"CAN interface {self.channel} bitrate is {current_bitrate}, "
+                "but the link is still down after attempting to bring it up."
+            )
 
         for args in (
             ("link", "set", self.channel, "down"),

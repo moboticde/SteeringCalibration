@@ -35,7 +35,8 @@ Task IDs are defined in `TASKS` in `main/CalibrationGUI.py`:
 
 - `run_all`: full steering workflow. It loads configuration, writes physical
   zero, runs encoder calibration, returns to current zero, then launches EOL.
-- `run_eol`: runs the external EOL-case flow for SO-1000 product barcodes.
+- `run_eol`: runs the external EOL-case flow for the currently scanned or
+  entered product barcode; EOL is product-folder/specification driven.
 - `traction_calibration`: delegates traction motor calibration to the separate
   `TrCalibration-Linux` project and records results in
   `/home/mobotic/Manufacturing/Calibration.xlsx`.
@@ -78,11 +79,16 @@ second server or control channel.
 
 ## Product Data Flow
 
-Product context starts from a scanned or manually entered product code:
+Product context starts from a product code. In QR camera mode the GUI starts
+scanning automatically. In QR scanner, barcode
+scanner, and manual modes the GUI waits for the operator to scan or type the
+product number in the product-code input flow.
 
 1. `resolve_product_scan_text()` receives the code.
-2. `io_helpers/find_product_folder.py` resolves a matching product folder using
-   `resources/config.yaml` and fallback search roots.
+2. `io_helpers/find_product_folder.py` resolves a matching product folder from
+   the configured product root and Manufacturing fallback roots. Production
+   product data lives under `/home/mobotic/Manufacturing`, including
+   `/home/mobotic/Manufacturing/01_Products` and direct product-family folders.
 3. `find_product_spec_path()` locates `ProductSpecifications_V2.xlsx`.
 4. `read_product_spec_parameters()` reads workbook parameters directly from the
    XLSX ZIP/XML structure.
@@ -96,6 +102,28 @@ Product context starts from a scanned or manually entered product code:
 
 If steering information is missing, the GUI disables steering-specific behavior
 for that product instead of guessing defaults.
+
+Product folders are runtime/manufacturing data, not application code. The repo
+should not depend on checked-in or hard-coded product folders such as
+`S-1000-200/...` being present. Each scanned or entered product must resolve its
+own folder under Manufacturing, and that folder is expected to provide at least:
+
+- `ProductSpecifications_V2.xlsx` with steering controller type, steering node
+  ID, CAN baudrate, zero angle, MU serial data where applicable, and EOL/product
+  parameters.
+- `01_SwConfiguration/SteeringScript.py` and related controller firmware/config
+  assets loaded by `logic/FlashSteeringScript.py`, `logic/FlashConfig.py`, or
+  `logic/FlashMPUFile.py`.
+- `02_EOL_Recepies/` workbooks such as `SteeringAppRecepie.xlsx`,
+  `SteeringMotorRecepie.xlsx`, `TractionRecepie.xlsx`, and `config.xlsx` when
+  the external EOL/test-manager path needs them.
+- `04_Results/` generated status, completion, and report artifacts created
+  during local operation.
+
+Specs must treat product-folder layout as an external contract resolved by
+`io_helpers/find_product_folder.py` and `resources/config.yaml`; they must not
+reintroduce product-specific hard-coded paths, copied scripts, or fallback values
+inside application code.
 
 ## Result Artifacts
 
@@ -114,7 +142,10 @@ Important result files:
 - `/home/mobotic/Manufacturing/Calibration.xlsx`: traction-calibration status
   workbook updated from this app when traction calibration is delegated.
 
-EOL gating requires Configuration, Write Zero, and Calibration to be OK in order.
+EOL gating for steering products requires Configuration, Write Zero, and
+Calibration to be OK in order before EOL is launched. Products without steering
+information may still use product-specific EOL recipes through the external EOL
+path when their product specification and `02_EOL_Recepies/` define those tests.
 This logic exists in both GUI helpers and `managers/test_manager.py` for the
 external EOL path.
 
@@ -122,14 +153,26 @@ external EOL path.
 
 ### `main/`
 
-Owns the browser UI and runtime orchestration. `CalibrationGUI.py` is large and
-contains product scanning, status workbook helpers, task dispatch, CAN preflight,
-report management, relay orchestration, controller readiness checks, manual spin,
-EOL integration, and HTTP request handling. `CalibrationGUI.html` owns the
-operator layout and client-side polling/actions.
+Owns the browser UI and runtime orchestration. `CalibrationGUI.py` now keeps
+`AppState`, task dispatch, CAN preflight, relay orchestration, controller
+readiness checks, manual spin, EOL integration, HTTP request handling, and
+server startup. `CalibrationGUI.html` owns the operator layout and client-side
+polling/actions.
+
+Supporting modules keep reusable non-HTTP behavior out of the GUI file:
+
+- `product_context.py`: scanned/entered product-code resolution, Manufacturing
+  product-folder search, `ProductSpecifications_V2.xlsx` parsing, steering
+  availability checks, and `ProductContext`/`ProductSpecCache` dataclasses.
+- `reporting.py`: lightweight XLSX status workbook IO, status/done workbook
+  path helpers, EOL sequence status checks, workflow status summaries, barcode
+  filename token normalization, and `RunAllReport`.
 
 Specs that change operator workflow, task availability, status wording, HTTP
-endpoints, report downloads, or cross-task orchestration usually start here.
+endpoints, report downloads, or cross-task orchestration usually start in
+`CalibrationGUI.py`. Specs that change product lookup/spec parsing should start
+in `product_context.py`; specs that change status workbook schema, EOL gating
+rows, or report file naming should start in `reporting.py`.
 
 ### `logic/`
 
@@ -250,18 +293,6 @@ vendor examples/docs, calibration logs, and config backups. Treat SDK contents a
 vendor-owned. Application code should use `logic/FullCalibration.py` or
 `logic/FlashConfigZero.py` instead of directly editing vendor examples.
 
-### `S-1000-200/`
-
-Example/current product folder with:
-
-- `ProductSpecifications_V2.xlsx`
-- `01_SwConfiguration/SteeringScript.py`
-- firmware/configuration files
-- EOL recipes
-- result artifacts
-
-This is production/product data, not generic application code.
-
 ### `mc/`
 
 Small local pymc compatibility shim used by MPU/config flashing. There is also a
@@ -276,11 +307,68 @@ larger copied `mc` tree inside product software configuration data.
 - SocketCAN bridge dry run: `.venv/bin/python systemd/start_can0.py --dry-run`
 - Tests: `ST_NONINTERACTIVE=1 .venv/bin/python -m pytest`
 
-## External Dependencies And Devices
+## Dependencies
 
-Python packages used by code include `canopen`, `python-can`, `pyserial`,
-`PyYAML`, `opencv-python`/`cv2`, `numpy`, `pandas`, `openpyxl`, `plotly`,
-`matplotlib`, `pyvisa`, and `pytest`.
+There is currently no checked-in `requirements.txt`, `pyproject.toml`, or lock
+file. The active `.venv` package inventory observed for this project is:
+
+- Production hardware/runtime: `canopen==2.4.1`, `python-can==4.6.1`,
+  `pyserial==3.5`, `PyYAML==6.0.3`, `opencv-python==4.13.0.92`,
+  `numpy==2.4.3`, `pandas==3.0.3`, `openpyxl==3.1.5`,
+  `plotly==6.8.0`, `matplotlib==3.10.8`, `PyVISA==1.16.2`,
+  `zxing-cpp==3.1.0`, `owon_psu==0.0.5`, `pillow==12.1.1`,
+  `setuptools==65.7.0`, and `typing_extensions==4.15.0`.
+- Test tooling: `pytest==9.1.1`, `iniconfig==2.3.0`, `packaging==26.0`,
+  `pluggy==1.6.0`, and `Pygments==2.20.0`.
+- Transitive plotting/data packages present in the environment include
+  `contourpy`, `cycler`, `et_xmlfile`, `fonttools`, `kiwisolver`, `narwhals`,
+  `pyparsing`, `python-dateutil`, `six`, `wrapt`, and `aenum`.
+
+Runtime imports depend directly on `canopen`, `python-can`, `serial`/
+`serial.tools.list_ports`, `yaml`, `cv2`, `numpy`, `pandas`, `openpyxl`,
+`plotly`, `matplotlib`, and `pyvisa`. Future specs should add or update a
+dedicated dependency manifest before introducing new third-party packages.
+
+Optional or legacy paths:
+
+- `drivers/driver_owon.py` supports OWON SPE6053 over serial, USBTMC, or VISA.
+  `PyVISA` is required only for the VISA backend; serial mode uses `pyserial`.
+- `drivers/driver_multimeter.py` requires `PyVISA`.
+- `drivers/driver_barcode.py` imports Windows-only `pywin32` modules
+  (`win32gui`, `win32process`, `win32con`) and `pynput`; these are not part of
+  the Linux `.venv` inventory and should be treated as legacy/optional unless a
+  spec explicitly revives that barcode path.
+- `zxing-cpp` is installed in the active virtualenv, but the current QR camera
+  path uses OpenCV `QRCodeDetector`.
+
+## Native System Dependencies
+
+The Linux deployment expects:
+
+- Python virtualenv at `.venv/` by convention for run scripts and systemd.
+- SocketCAN kernel/userland tools: `slcan`, `/usr/bin/slcand`,
+  `/usr/sbin/ip`, and `/usr/sbin/modprobe`.
+- A `can0` SocketCAN interface, usually created by `systemd/st-can0.service`.
+- Serial-device permissions for USB adapters, usually through Linux dialout or
+  equivalent device-group membership.
+- Browser availability for `webbrowser.open()` from `main/CalibrationGUI.py`.
+- iC-Haus MU 3SL native library:
+  `MU/MU_3SL_interface_3.4.1/bin/linux/x86_64/libMU_3SL_interface.so.3.4.1`.
+
+Important environment variables:
+
+- `ST_NONINTERACTIVE=1`: automated tests and non-interactive runs must raise
+  instead of blocking on operator prompts.
+- `ST_CAN_CHANNEL`: override SocketCAN channel name, default `can0`.
+- `ST_CAN_INTERFACE`: override python-can interface, default `socketcan`.
+- `ST_CAN_SERIAL`: override serial device used by `systemd/start_can0.py`.
+- `ST_CAMERA_ID`: override steering camera index.
+- `ST_CAMERA_DEVICE` / `QR_READER_CAMERA`: override camera device selection for
+  QR reading.
+- `ST_DEBUG`: enable extra debug output in selected test-manager paths.
+- `MPLCONFIGDIR`: used by `run_protected.sh`; defaults to `.cache/matplotlib`.
+
+## External Devices And Projects
 
 External hardware and services include:
 
@@ -346,3 +434,13 @@ from unit tests.
   Specs should distinguish application code changes from generated data changes.
 - Paths are currently local-machine oriented under `/home/mobotic`. New specs
   that change portability must explicitly preserve current production defaults.
+- Current code still contains legacy SO-specific EOL checks in
+  `main/CalibrationGUI.py` (`is_so_unit`, `EOL disabled for non-SO units`, and
+  `Product barcode must start with SO-1000`). This conflicts with the intended
+  Manufacturing-folder workflow where EOL is available for multiple product
+  families resolved from the scanned or entered product number. Specs that touch
+  EOL should remove the SO-only assumptions and gate by product specification,
+  available recipes, and required preparation status instead.
+- `resources/config.yaml` currently controls the first product lookup root. For
+  production use this must align with `/home/mobotic/Manufacturing`; callers
+  outside `main/CalibrationGUI.py` may not get the GUI's fallback search roots.

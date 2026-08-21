@@ -116,6 +116,28 @@
       font-weight: 800;
     }
 
+    .relay-mode-row {
+      display: grid;
+      grid-template-columns: 1fr minmax(128px, 150px);
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .relay-mode-row select {
+      min-height: 32px;
+      padding: 5px 8px;
+      border: 2px solid var(--blue);
+      border-radius: 6px;
+      color: var(--muted);
+      background: var(--black);
+      font: 12px "DejaVu Sans", "Liberation Sans", sans-serif;
+      font-weight: 800;
+      outline: none;
+    }
+
     #relay-status-badge {
       min-width: 48px;
       padding: 4px 8px;
@@ -724,7 +746,7 @@
 
     .ux-scan {
       display: grid;
-      grid-template-columns: 1fr auto;
+      grid-template-columns: 1fr minmax(88px, auto) auto;
       gap: 10px;
       align-items: end;
       margin: 0;
@@ -749,6 +771,13 @@
       color: #ffffff;
       background: rgba(6, 9, 12, 0.88);
       font: 14px "DejaVu Sans", "Liberation Sans", sans-serif;
+    }
+
+    .ux-scan button {
+      min-height: 36px;
+      padding: 7px 12px;
+      border-radius: 4px;
+      font-size: 13px;
     }
 
     .ux-status-inline {
@@ -1325,6 +1354,7 @@
                 <option value="manual">Manual</option>
               </select>
             </label>
+            <button id="rescan-product" type="button">Rescan</button>
             <div id="scan-health" class="ux-status-inline"><span class="ux-dot"></span>Camera OK</div>
           </div>
         </div>
@@ -1375,7 +1405,7 @@
             <div class="ux-center-actions">
               <button class="run-all" data-task="traction_calibration" type="button"><span>▶</span>Traction Calibration</button>
               <div></div>
-              <div class="ux-run-note">Runs the selected traction calibration program for the scanned motor.</div>
+              <div class="ux-run-note">Runs the selected traction calibration program for the scanned product number.</div>
             </div>
           </section>
 
@@ -1450,6 +1480,13 @@
           <h2 class="ux-title">Relay Power Status</h2>
           <span id="relay-status-badge">Error</span>
         </div>
+        <label class="relay-mode-row" for="relay-mode">
+          <span>Task Relay Mode</span>
+          <select id="relay-mode">
+            <option value="automatic">Automatic</option>
+            <option value="manual">Manual</option>
+          </select>
+        </label>
         <div class="relay-footer">
           <button id="relays-power-on" type="button" title="Activate STO A, STO B, BRAKE, 24V, Rele+, and Rele-"><span>⏻</span>Power On</button>
           <button id="relays-restart" type="button" title="Power-cycle the controller relays and reconnect CAN"><span>↻</span>Restart</button>
@@ -1485,6 +1522,7 @@
     const statusFeedEl = document.querySelector("#status-feed");
     const logEl = document.querySelector("#log");
     const scanOptionEl = document.querySelector("#scan-option");
+    const rescanProductEl = document.querySelector("#rescan-product");
     const canNodeInputEl = document.querySelector("#can-node");
     const canBitrateInputEl = document.querySelector("#can-bitrate");
     const connectCanEl = document.querySelector("#connect-can");
@@ -1500,6 +1538,7 @@
     const relaysCheckTerminationEl = document.querySelector("#relays-check-termination");
     const relaysPowerOffEl = document.querySelector("#relays-power-off");
     const relayStatusBadgeEl = document.querySelector("#relay-status-badge");
+    const relayModeEl = document.querySelector("#relay-mode");
     const continuePowerCycleEl = document.querySelector("#continue-power-cycle");
     const spinLeftEl = document.querySelector("#spin-left");
     const spinRightEl = document.querySelector("#spin-right");
@@ -1544,15 +1583,19 @@
     let canConnected = false;
     let canCheckRunning = true;
     let controllerEnabled = false;
+    let productScanCompleted = false;
     let steeringAvailable = null;
-    let tractionAvailable = false;
+    let steeringVisible = false;
+    let tractionAvailable = true;
+    let tractionStatusMessage = "Scan product number first.";
     let eolAvailable = false;
     let eolStatusMessage = "Scan product first.";
     let eolReportUrl = "";
     let eolReportName = "";
     let scannedProductCode = "";
     let currentScanOption = "qr_camera";
-    let activeWorkflowTab = "steering";
+    let awaitingRelayConfirmation = false;
+    let activeWorkflowTab = "";
     let awaitingProductScanPrompt = false;
     let spinnerFrame = 0;
     const SPINNER_FRAMES = ["|", "/", "-", "\\"];
@@ -1573,6 +1616,7 @@
       connectCanEl.disabled = isBusy;
       driveEnableEl.disabled = isBusy || !canConnected;
       clearErrorsEl.disabled = isBusy || !canConnected;
+      relayModeEl.disabled = isBusy;
     }
 
     function setMainStatus(text, state) {
@@ -1645,7 +1689,12 @@
 
     function updateSystemStatus(data) {
       const failing = data.has_error === true || data.relay_connection_ok === false;
-      const waiting = data.running === true || data.can_check_running === true || data.relay_connecting === true;
+      const waiting = (
+        data.running === true
+        || data.can_check_running === true
+        || data.relay_connecting === true
+        || data.awaiting_relay_confirmation === true
+      );
       if (failing) {
         setBadge(systemStatusEl, "System Error", "fail");
       } else if (waiting) {
@@ -1796,30 +1845,49 @@
       viewTitleEl.textContent = debug ? "Debug" : "Status";
     }
 
+    function firstVisibleWorkflowTab() {
+      if (steeringVisible) {
+        return "steering";
+      }
+      if (tractionAvailable) {
+        return "traction";
+      }
+      if (eolAvailable) {
+        return "eol";
+      }
+      return "";
+    }
+
     function setWorkflowTab(tabName) {
-      const tabEl = workflowTabEls.find((el) => el.dataset.workflowTab === tabName);
-      if (tabEl && tabEl.disabled) {
+      let targetTab = tabName;
+      if (targetTab === "steering" && !steeringVisible) {
+        targetTab = firstVisibleWorkflowTab();
+      }
+      const tabEl = workflowTabEls.find((el) => el.dataset.workflowTab === targetTab);
+      if (tabEl && (tabEl.disabled || tabEl.hidden)) {
         return;
       }
-      if (tabName === "steering" && steeringAvailable === false) {
-        tabName = eolAvailable ? "eol" : (tractionAvailable ? "traction" : "steering");
-      }
-      if (activeWorkflowTab === "steering" && tabName !== "steering") {
+      if (!targetTab) {
+        stopHeldSpin();
+      } else if (activeWorkflowTab === "steering" && targetTab !== "steering") {
         stopHeldSpin();
       }
-      activeWorkflowTab = tabName;
+      activeWorkflowTab = targetTab;
       workflowTabEls.forEach((tabEl) => {
-        tabEl.classList.toggle("active", tabEl.dataset.workflowTab === tabName);
+        tabEl.classList.toggle("active", targetTab && tabEl.dataset.workflowTab === targetTab);
       });
       workflowPanelEls.forEach((panelEl) => {
-        panelEl.classList.toggle("active", panelEl.dataset.workflowPanel === tabName);
+        panelEl.classList.toggle("active", targetTab && panelEl.dataset.workflowPanel === targetTab);
       });
-      manualJogEl.classList.toggle("hidden", tabName !== "steering");
+      manualJogEl.classList.toggle("hidden", targetTab !== "steering");
     }
 
     function updateWorkflowAvailability(data) {
+      productScanCompleted = data.product_scan_completed === true || Boolean(data.product_qr_code);
       steeringAvailable = data.steering_available;
+      steeringVisible = productScanCompleted && steeringAvailable === true;
       tractionAvailable = data.traction_available === true;
+      tractionStatusMessage = data.traction_status_message || "Scan product number first.";
       eolAvailable = data.eol_available === true;
       eolStatusMessage = data.eol_status_message || "EOL is not available.";
       eolReportUrl = data.eol_report_url || (data.eol_done === true ? EOL_REPORT_URL : "");
@@ -1834,18 +1902,27 @@
       reportText.className = "ux-report-text";
       reportText.textContent = hasEolReport ? `See last report\n${eolReportName}` : "See last report";
       eolLastReportEl.replaceChildren(reportIcon, reportText);
-      const steeringDisabled = steeringAvailable === false;
+      const steeringDisabled = !steeringVisible;
       const tractionDisabled = !tractionAvailable;
       const eolDisabled = !eolAvailable;
       workflowTabEls.forEach((tabEl) => {
         if (tabEl.dataset.workflowTab === "steering") {
+          tabEl.hidden = !steeringVisible;
           tabEl.disabled = steeringDisabled;
+          tabEl.title = steeringDisabled
+            ? (productScanCompleted ? "This product has no steering workflow." : "Scan a product first.")
+            : "";
         } else if (tabEl.dataset.workflowTab === "traction") {
           tabEl.disabled = tractionDisabled;
-          tabEl.title = tractionDisabled ? "Traction is disabled for SO units." : "";
+          tabEl.title = tractionDisabled ? tractionStatusMessage : "";
         } else if (tabEl.dataset.workflowTab === "eol") {
           tabEl.disabled = eolDisabled;
           tabEl.title = eolStatusMessage;
+        }
+      });
+      workflowPanelEls.forEach((panelEl) => {
+        if (panelEl.dataset.workflowPanel === "steering") {
+          panelEl.hidden = !steeringVisible;
         }
       });
 
@@ -1854,7 +1931,7 @@
           button.disabled = steeringDisabled || data.running === true;
         } else if (button.dataset.task === "traction_calibration") {
           button.disabled = tractionDisabled || data.running === true;
-          button.title = tractionDisabled ? "Traction is disabled for SO units." : "";
+          button.title = tractionDisabled ? tractionStatusMessage : "";
         } else if (button.dataset.task === "run_eol") {
           button.disabled = eolDisabled || data.running === true;
           button.title = eolStatusMessage;
@@ -1863,14 +1940,8 @@
       const activeTabEl = workflowTabEls.find((tabEl) => (
         tabEl.dataset.workflowTab === activeWorkflowTab
       ));
-      if (activeTabEl && activeTabEl.disabled) {
-        if (!steeringDisabled) {
-          setWorkflowTab("steering");
-        } else if (!tractionDisabled) {
-          setWorkflowTab("traction");
-        } else if (!eolDisabled) {
-          setWorkflowTab("eol");
-        }
+      if (!activeTabEl || activeTabEl.disabled || activeTabEl.hidden) {
+        setWorkflowTab(firstVisibleWorkflowTab());
       }
     }
 
@@ -1885,6 +1956,22 @@
         return "Enter product code";
       }
       return "Scan product code";
+    }
+
+    function promptProductScanText(option) {
+      const previous = localStorage.getItem("lastProductScan") || "";
+      const scanned = window.prompt(scanOptionLabel(option), previous);
+      if (scanned === null) {
+        return null;
+      }
+      const trimmed = scanned.trim();
+      if (!trimmed) {
+        setActivityMessage("Product code is required", "Scan or enter a product code.", true);
+        setView("status");
+        return null;
+      }
+      localStorage.setItem("lastProductScan", trimmed);
+      return trimmed;
     }
 
     async function submitProductScan(scanText) {
@@ -1918,46 +2005,62 @@
       }
       awaitingProductScanPrompt = true;
       window.setTimeout(async () => {
-        const previous = localStorage.getItem("lastProductScan") || "";
-        const scanned = window.prompt(scanOptionLabel(option), previous);
+        const scanned = promptProductScanText(option);
         awaitingProductScanPrompt = false;
-        if (scanned === null) {
-          return;
+        if (scanned !== null) {
+          await submitProductScan(scanned);
         }
-        const trimmed = scanned.trim();
-        if (!trimmed) {
-          setActivityMessage("Product code is required", "Scan or enter a product code.", true);
-          setView("status");
-          return;
-        }
-        localStorage.setItem("lastProductScan", trimmed);
-        await submitProductScan(trimmed);
       }, 50);
     }
 
-    async function startTask(task) {
-      if (steeringAvailable === false && STEERING_TASKS.has(task)) {
-        setActivityMessage("Steering disabled", "This product specification has no steering information.", false);
-        if (eolAvailable) {
-          setWorkflowTab("eol");
+    async function rescanProduct() {
+      const option = scanOptionEl.value;
+      const params = new URLSearchParams({ option });
+      if (option !== "qr_camera") {
+        const scanned = promptProductScanText(option);
+        if (scanned === null) {
+          return;
         }
+        params.set("product_code", scanned);
+      }
+      setActivityMessage(
+        "Product rescan",
+        option === "qr_camera" ? "Starting QR camera scan." : "Loading product specification.",
+        false
+      );
+      setView("status");
+      rescanProductEl.disabled = true;
+      try {
+        const response = await fetch(`/rescan-product?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Product rescan failed", data.error || "Open Debug for details.", true);
+          setView("status");
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      await refreshStatus();
+    }
+
+    async function startTask(task) {
+      if (STEERING_TASKS.has(task) && !steeringVisible) {
+        const message = productScanCompleted
+          ? "This product specification has no steering information."
+          : "Scan a steering product before starting steering tasks.";
+        setActivityMessage("Steering disabled", message, false);
+        setWorkflowTab(firstVisibleWorkflowTab());
         setView("status");
         return;
       }
       if (task === "traction_calibration" && !tractionAvailable) {
-        setActivityMessage("Traction disabled", "Traction is disabled for SO units.", false);
+        setActivityMessage("Traction disabled", tractionStatusMessage, false);
         setView("status");
         return;
       }
       if (task === "run_eol" && !eolAvailable) {
         setActivityMessage("EOL disabled", eolStatusMessage, true);
-        setView("status");
-        return;
-      }
-      if (!canConnected && task !== "run_eol" && task !== "traction_calibration") {
-        setActivityMessage("Switch On Power Supply", "Power and CAN are required before this steering task.", false);
-        setCanStatus("Switch On Power Supply", "");
-        setMainStatus("Switch On Power Supply", "");
         setView("status");
         return;
       }
@@ -1995,11 +2098,6 @@
           setView("status");
           return;
         }
-        if (!trimmedProductBarcode.toUpperCase().startsWith("SO-1000")) {
-          setActivityMessage("Invalid product barcode", "Product barcode must start with SO-1000.", true);
-          setView("status");
-          return;
-        }
         localStorage.setItem("eolProductBarcode", trimmedProductBarcode);
         params.set("product_barcode", trimmedProductBarcode);
 
@@ -2021,19 +2119,19 @@
         params.set("motor_barcode", trimmedMotorBarcode);
       }
       if (task === "traction_calibration") {
-        const previousMotorBarcode = localStorage.getItem("tractionMotorBarcode") || "";
-        const motorBarcode = window.prompt("Scan motor barcode for Traction calibration", previousMotorBarcode);
-        if (motorBarcode === null) {
+        const previousProductBarcode = localStorage.getItem("tractionProductBarcode") || scannedProductCode || "";
+        const productBarcode = window.prompt("Scan product number for Traction calibration", previousProductBarcode);
+        if (productBarcode === null) {
           return;
         }
-        const trimmedMotorBarcode = motorBarcode.trim();
-        if (!trimmedMotorBarcode) {
-          setActivityMessage("Motor barcode required", "Scan motor barcode for Traction calibration.", true);
+        const trimmedProductBarcode = productBarcode.trim();
+        if (!trimmedProductBarcode) {
+          setActivityMessage("Product number required", "Scan product number for Traction calibration.", true);
           setView("status");
           return;
         }
-        localStorage.setItem("tractionMotorBarcode", trimmedMotorBarcode);
-        params.set("motor_barcode", trimmedMotorBarcode);
+        localStorage.setItem("tractionProductBarcode", trimmedProductBarcode);
+        params.set("product_barcode", trimmedProductBarcode);
       }
       try {
         const response = await fetch(`/start?${params.toString()}`, { method: "POST" });
@@ -2108,10 +2206,16 @@
         const data = await response.json();
         canConnected = data.can_connection_ok === true;
         canCheckRunning = data.can_check_running === true;
+        awaitingRelayConfirmation = data.awaiting_relay_confirmation === true;
         controllerEnabled = data.controller_enabled === true;
         if (data.product_scan_completed === true || data.product_scan_running === true) {
           awaitingProductScanPrompt = false;
         }
+        rescanProductEl.disabled = (
+          data.running === true
+          || data.product_scan_running === true
+          || data.can_check_running === true
+        );
         if (document.activeElement !== scanOptionEl && data.scan_option) {
           scanOptionEl.value = data.scan_option;
         }
@@ -2120,6 +2224,9 @@
         }
         if (document.activeElement !== canBitrateInputEl && data.can_connection_bitrate !== null && data.can_connection_bitrate !== undefined) {
           canBitrateInputEl.value = String(data.can_connection_bitrate);
+        }
+        if (document.activeElement !== relayModeEl && data.relay_mode) {
+          relayModeEl.value = data.relay_mode;
         }
         let connectionText = "";
         let connectionState = "";
@@ -2137,7 +2244,7 @@
           connectionText = data.can_connection_message || "CAN connection failed.";
           connectionState = disconnected ? "" : "fail";
         }
-        if (data.running === true || data.awaiting_power_cycle === true) {
+        if (data.running === true || data.awaiting_power_cycle === true || awaitingRelayConfirmation) {
           setMainStatus(data.status || "Running.", "");
         } else if (data.has_error === true && data.status && !["Choose one operation", "Ready."].includes(data.status)) {
           setMainStatus(data.status, "fail");
@@ -2160,7 +2267,16 @@
         updatePipeline(data);
         updateActivity(data);
         maybePromptProductScan(data);
-        continuePowerCycleEl.classList.toggle("visible", data.awaiting_power_cycle === true);
+        if (data.awaiting_power_cycle === true) {
+          continuePowerCycleEl.textContent = "Continue after power cycle";
+        } else if (awaitingRelayConfirmation) {
+          const action = data.relay_confirmation_action || "relay step";
+          continuePowerCycleEl.textContent = `Continue after relay ${action}`;
+        }
+        continuePowerCycleEl.classList.toggle(
+          "visible",
+          data.awaiting_power_cycle === true || awaitingRelayConfirmation
+        );
 
         if (data.log.length !== lastLength) {
           logEl.textContent = data.log;
@@ -2362,6 +2478,23 @@
       await refreshStatus();
     }
 
+    async function setRelayMode(mode) {
+      const params = new URLSearchParams({ mode });
+      try {
+        const response = await fetch(`/relay-mode?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Relay mode failed", data.error || "Could not set relay mode.", true);
+          await refreshStatus();
+          return;
+        }
+        setActivityMessage("Relay mode changed", `Task relay mode: ${data.relay_mode}.`, false);
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+      }
+      await refreshStatus();
+    }
+
     buttons.forEach((button) => {
       button.addEventListener("click", () => startTask(button.dataset.task));
     });
@@ -2381,6 +2514,7 @@
       }
       await refreshStatus();
     });
+    rescanProductEl.addEventListener("click", rescanProduct);
 
     connectCanEl.addEventListener("click", () => checkCanConnection(true));
     driveEnableEl.addEventListener("click", toggleControllerEnabled);
@@ -2389,6 +2523,7 @@
     relaysRestartEl.addEventListener("click", () => runRelayAction("restart"));
     relaysCheckTerminationEl.addEventListener("click", () => runRelayAction("check_termination"));
     relaysPowerOffEl.addEventListener("click", () => runRelayAction("power_off"));
+    relayModeEl.addEventListener("change", () => setRelayMode(relayModeEl.value));
     eolLastReportEl.addEventListener("click", () => {
       if (!eolReportUrl) {
         return;
@@ -2412,9 +2547,12 @@
 
     continuePowerCycleEl.addEventListener("click", async () => {
       try {
-        await fetch("/confirm-power-cycle", { method: "POST" });
+        const endpoint = awaitingRelayConfirmation
+          ? "/confirm-relay-step"
+          : "/confirm-power-cycle";
+        await fetch(endpoint, { method: "POST" });
       } catch (error) {
-        setActivityMessage("Could not confirm power cycle", String(error), true);
+        setActivityMessage("Could not confirm", String(error), true);
       }
       await refreshStatus();
     });

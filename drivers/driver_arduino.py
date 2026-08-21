@@ -1,5 +1,5 @@
 # drivers/driver_arduino.py — robust port/framing probe + single-value fallback
-import os, time, yaml, struct
+import os, time, yaml, struct, threading
 import serial.tools.list_ports
 from serial import Serial, SerialException
 from io_helpers.find_device import find_serial_port
@@ -75,6 +75,8 @@ def _frame1(tp: int, payload: bytes = b"") -> bytes:
     return bytes([H0, H1, tp, ln]) + payload + bytes([_checksum1(tp, ln, payload)])
 
 _shared_serial = None
+_shared_len_mode = 2
+_serial_io_lock = threading.RLock()
 
 class DriverArduino:
     """
@@ -91,10 +93,17 @@ class DriverArduino:
                 _shared_serial = None
             else:
                 self.arduino = _shared_serial
+                self._len_mode = _shared_len_mode
                 return
         self.arduino = None
-        self.initialize_arduino()
+        try:
+            self.initialize_arduino()
+        except Exception:
+            self._close_serial_quietly(self.arduino)
+            self.arduino = None
+            raise
         _shared_serial = self.arduino
+        self._publish_shared_protocol()
 
     # ---------- Port open + probing ----------
     def initialize_arduino(self):
@@ -144,6 +153,20 @@ class DriverArduino:
                 "Programming Port and update resources/config.yaml accordingly."
             )
             raise RuntimeError(message)
+
+        self._publish_shared_protocol()
+
+    def _publish_shared_protocol(self) -> None:
+        global _shared_len_mode
+        _shared_len_mode = self._len_mode
+
+    @staticmethod
+    def _close_serial_quietly(serial_obj) -> None:
+        try:
+            if serial_obj is not None and getattr(serial_obj, "is_open", False):
+                serial_obj.close()
+        except Exception:
+            pass
 
     def _simple_probe(self) -> bool:
         # Try 2-byte LEN
@@ -231,25 +254,27 @@ class DriverArduino:
         return self._read_frame2(expect_type, timeout_s) if self._len_mode == 2 else self._read_frame1(expect_type, timeout_s)
 
     def _send_cmd_raw(self, tp: int, payload: bytes, expect_type: int, timeout_s: float):
-        try:
-            self.arduino.reset_input_buffer()
-        except Exception:
-            pass
-        pkt = _frame2(tp, payload) if self._len_mode == 2 else _frame1(tp, payload)
-        if _DEBUG_FRAMES: print(f"[TX{self._len_mode}] {_hexdump(pkt)}")
-        self.arduino.write(pkt)
-        self.arduino.flush()
-        return self._read_frame(expect_type, timeout_s)
+        with _serial_io_lock:
+            try:
+                self.arduino.reset_input_buffer()
+            except Exception:
+                pass
+            pkt = _frame2(tp, payload) if self._len_mode == 2 else _frame1(tp, payload)
+            if _DEBUG_FRAMES: print(f"[TX{self._len_mode}] {_hexdump(pkt)}")
+            self.arduino.write(pkt)
+            self.arduino.flush()
+            return self._read_frame(expect_type, timeout_s)
 
     def _send_cmd(self, tp: int, payload: bytes = b"", expect_type: int = None, timeout_s: float = 1.0):
         if expect_type is None:
             # fire-and-forget
-            try: self.arduino.reset_input_buffer()
-            except Exception: pass
-            pkt = _frame2(tp, payload) if self._len_mode == 2 else _frame1(tp, payload)
-            if _DEBUG_FRAMES: print(f"[TX{self._len_mode}] {_hexdump(pkt)}")
-            self.arduino.write(pkt); self.arduino.flush()
-            return None
+            with _serial_io_lock:
+                try: self.arduino.reset_input_buffer()
+                except Exception: pass
+                pkt = _frame2(tp, payload) if self._len_mode == 2 else _frame1(tp, payload)
+                if _DEBUG_FRAMES: print(f"[TX{self._len_mode}] {_hexdump(pkt)}")
+                self.arduino.write(pkt); self.arduino.flush()
+                return None
         # normal request/response
         return self._send_cmd_raw(tp, payload, expect_type, timeout_s)
 
@@ -523,6 +548,7 @@ class DriverArduino:
     # ---- close/open ----
     def close_arduino(self):
         """Force all relays off and close the serial port."""
+        global _shared_serial
         import time
 
         try:
@@ -552,6 +578,8 @@ class DriverArduino:
             try:
                 if getattr(self, "arduino", None) and getattr(self.arduino, "is_open", False):
                     self.arduino.close()
+                if getattr(self, "arduino", None) is _shared_serial:
+                    _shared_serial = None
             except Exception as e:
                 print(f"[WARN] close_arduino: error closing serial: {e}")
 

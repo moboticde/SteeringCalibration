@@ -11,15 +11,11 @@ import sys
 import threading
 import time
 import webbrowser
-import zipfile
-from dataclasses import dataclass
 from datetime import datetime
-from xml.etree import ElementTree as ET
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from traceback import format_exc
 from urllib.parse import parse_qs, urlparse
-from xml.sax.saxutils import escape
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(PROJECT_ROOT) not in sys.path:
@@ -30,6 +26,12 @@ EOL_CASE_ROOT = Path("/home/mobotic/Internal Projects/EOL-case/02_EOL_files")
 EOL_CASE_MAIN_PATH = EOL_CASE_ROOT / "main" / "mobotic_EOL.py"
 TRACTION_CALIBRATION_ROOT = Path("/home/mobotic/Internal Projects/TrCalibration-Linux")
 TRACTION_CALIBRATION_WORKBOOK = MANUFACTURING_ROOT / "Calibration.xlsx"
+TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE = "auto"
+TRACTION_MHM_USB_ADAPTER_IDS = {
+    "1ae4:3101": "MB5U",
+    "1ae4:0003": "MB4U",
+    "0403:6010": "MB3U/FTDI iC-Haus",
+}
 EOL_CASE_IMPORT_PREFIXES = (
     "calibration",
     "drivers",
@@ -42,6 +44,12 @@ EOL_CASE_IMPORT_PREFIXES = (
 )
 
 from utils.interrupt_guard import install_deferred_keyboard_interrupt
+from main import product_context as product_context_module
+from main.relay_manager import (
+    RELAY_MODE_AUTOMATIC,
+    TaskRelayLifecycle,
+    parse_relay_mode,
+)
 
 
 BASE_DIR = PROJECT_ROOT
@@ -80,6 +88,7 @@ ZERO_MOVE_SETTLE_S = 2.0
 ZERO_MOVE_TIMEOUT_S = 25.0
 ZERO_POSITION_TOLERANCE_COUNTS = 3
 POWER_CYCLE_CONFIRM_TIMEOUT_S = 600.0
+RELAY_CONFIRM_TIMEOUT_S = 600.0
 CONTROLLER_ENCODER_DIGITAL_OUTPUT = False
 SSI_READY_STATUS = 9
 RELAY_STO_A = 1
@@ -98,9 +107,12 @@ CONTROLLER_POWER_RELAYS = (
 )
 CONTROLLER_POWER_CYCLE_OFF_S = 3.0
 CONTROLLER_POWER_ON_SETTLE_S = 3.0
+OPERATION_RELAY_SETTLE_S = 3.0
 ST_CAN_SERVICE_NAME = "st-can0.service"
 ST_CAN_SERVICE_RESTART_TIMEOUT_S = 10.0
 ST_CAN_SERVICE_RESTART_SETTLE_S = 1.0
+ST_SUDO_PASSWORD_ENV = "ST_SUDO_PASSWORD"
+ST_DEFAULT_SUDO_PASSWORD = "mobotic"
 
 
 TASKS = {
@@ -117,320 +129,70 @@ TASKS = {
 }
 
 TASKS_REQUIRING_TESTER_NAME = {"run_all", "run_eol"}
+STEERING_TASK_IDS = {
+    "run_all",
+    "load_script_config",
+    "load_script",
+    "load_config",
+    "start_calibration",
+    "test_calibration",
+    "show_current_zero",
+    "start_zeroing",
+}
+STEERING_TASK_IDS_REQUIRING_START_CAN = {
+    "run_all",
+    "load_script_config",
+    "load_script",
+    "load_config",
+    "start_calibration",
+    "test_calibration",
+    "start_zeroing",
+}
 
 
-LEGACY_RUN_ALL_REPORT_COLUMNS = (
-    "Serial number",
-    "Configuration",
-    "Write Zero",
-    "Calibration",
+from main.product_context import (
+    ProductContext,
+    ProductSpecCache,
+    configured_product_base_path,
+    find_product_family_folder_from_roots as _find_product_family_folder_from_roots,
+    find_product_spec_path,
+    read_product_spec_parameters,
+    resolve_product_family_dir,
+    resolve_product_scan_text,
+    scan_product_context,
+    validate_eol_recipe_files,
 )
-RUN_ALL_REPORT_COLUMNS = (
-    "Date",
-    *LEGACY_RUN_ALL_REPORT_COLUMNS,
+from main.reporting import (
+    EOL_SEQUENCE_STEPS,
+    LEGACY_RUN_ALL_REPORT_COLUMNS,
+    RUN_ALL_REPORT_COLUMNS,
+    RunAllReport,
+    conf_workflow_status_for_product,
+    conf_workflow_status_from_rows,
+    done_workbook_path_for_qr,
+    eol_done_report_for_product,
+    eol_sequence_status_for_product,
+    eol_sequence_status_from_rows,
+    is_so_unit,
+    normalize_conf_report_rows,
+    product_unit_prefix,
+    read_conf_xlsx_rows,
+    safe_filename_token,
+    status_workbook_path_for_qr,
+    write_conf_xlsx_rows,
 )
-EOL_SEQUENCE_STEPS = (
-    ("Configuration",),
-    ("Write Zero", "Zeroing"),
-    ("Calibration",),
-)
 
 
-def safe_filename_token(value: object, fallback: str = "run_all") -> str:
-    token = re.sub(r"[^A-Za-z0-9_.-]+", "_", str(value or "").strip())
-    token = token.strip("._")
-    return token[:80] or fallback
-
-
-def _xlsx_column_name(index: int) -> str:
-    name = ""
-    while index:
-        index, remainder = divmod(index - 1, 26)
-        name = chr(65 + remainder) + name
-    return name
-
-
-def _xlsx_column_index(cell_ref: str) -> int:
-    letters = "".join(char for char in cell_ref if char.isalpha())
-    index = 0
-    for char in letters:
-        index = index * 26 + (ord(char.upper()) - 64)
-    return index
-
-
-def _xlsx_cell(row_idx: int, col_idx: int, value: object) -> str:
-    cell_ref = f"{_xlsx_column_name(col_idx)}{row_idx}"
-    text = "" if value is None else str(value)
-    return (
-        f'<c r="{cell_ref}" t="inlineStr">'
-        f"<is><t>{escape(text)}</t></is>"
-        f"</c>"
-    )
-
-
-def read_conf_xlsx_rows(path: Path) -> list[list[str]]:
-    if not path.is_file():
-        return []
-    try:
-        with zipfile.ZipFile(path) as archive:
-            sheet_xml = archive.read("xl/worksheets/sheet1.xml")
-    except zipfile.BadZipFile:
-        return []
-    except Exception as exc:
-        print(f"[WARN] Could not read existing result workbook {path}: {exc}")
-        return []
-
-    ns = {"x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
-    try:
-        root = ET.fromstring(sheet_xml)
-    except ET.ParseError as exc:
-        print(f"[WARN] Could not parse existing result workbook {path}: {exc}")
-        return []
-
-    parsed_rows: list[list[str]] = []
-    for row in root.findall(".//x:sheetData/x:row", ns):
-        values_by_col: dict[int, str] = {}
-        for cell in row.findall("x:c", ns):
-            cell_ref = cell.attrib.get("r", "")
-            col_idx = _xlsx_column_index(cell_ref)
-            if col_idx <= 0:
-                continue
-            text = "".join(
-                node.text or ""
-                for node in cell.findall(".//x:is/x:t", ns)
-            )
-            values_by_col[col_idx] = text
-        if not values_by_col:
-            parsed_rows.append([])
-            continue
-        max_col = max(values_by_col)
-        parsed_rows.append([values_by_col.get(col_idx, "") for col_idx in range(1, max_col + 1)])
-    return parsed_rows
-
-
-def write_conf_xlsx_rows(path: Path, rows: list[list[object]]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-
-    sheet_rows = []
-    for row_idx, row in enumerate(rows, 1):
-        cells = "".join(
-            _xlsx_cell(row_idx, col_idx, value)
-            for col_idx, value in enumerate(row, 1)
-        )
-        sheet_rows.append(f'<row r="{row_idx}">{cells}</row>')
-
-    col_count = max((len(row) for row in rows), default=2)
-    col_widths = []
-    for col_idx in range(1, col_count + 1):
-        width = 24 if col_idx <= 4 else 32
-        if col_idx in (12, 15):
-            width = 80
-        col_widths.append(
-            f'<col min="{col_idx}" max="{col_idx}" width="{width}" customWidth="1"/>'
-        )
-
-    sheet_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        f"<cols>{''.join(col_widths)}</cols>"
-        f"<sheetData>{''.join(sheet_rows)}</sheetData>"
-        "</worksheet>"
-    )
-    workbook_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="conf" sheetId="1" r:id="rId1"/></sheets>'
-        "</workbook>"
-    )
-    content_types_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/>'
-        '<Default Extension="xml" ContentType="application/xml"/>'
-        '<Override PartName="/xl/workbook.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" '
-        'ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'
-        "</Types>"
-    )
-    root_rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" '
-        'Target="xl/workbook.xml"/>'
-        "</Relationships>"
-    )
-    workbook_rels_xml = (
-        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
-        '<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" '
-        'Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" '
-        'Target="worksheets/sheet1.xml"/>'
-        "</Relationships>"
-    )
-
-    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-        archive.writestr("[Content_Types].xml", content_types_xml)
-        archive.writestr("_rels/.rels", root_rels_xml)
-        archive.writestr("xl/workbook.xml", workbook_xml)
-        archive.writestr("xl/_rels/workbook.xml.rels", workbook_rels_xml)
-        archive.writestr("xl/worksheets/sheet1.xml", sheet_xml)
-
-
-def _row_values_by_header(header: list[str], row: list[object]) -> dict[str, object]:
-    return {
-        str(column): row[idx] if idx < len(row) else ""
-        for idx, column in enumerate(header)
-    }
-
-
-def normalize_conf_report_rows(rows: list[list[str]]) -> list[list[object]]:
-    header = list(RUN_ALL_REPORT_COLUMNS)
-    if not rows:
-        return [header]
-
-    existing_header = [str(value) for value in rows[0]]
-    if existing_header == header:
-        return rows
-
-    if existing_header == list(LEGACY_RUN_ALL_REPORT_COLUMNS):
-        normalized: list[list[object]] = [header]
-        for row in rows[1:]:
-            values = _row_values_by_header(existing_header, row)
-            normalized.append(["", *[values.get(column, "") for column in LEGACY_RUN_ALL_REPORT_COLUMNS]])
-        return normalized
-
-    print(
-        "[WARN] Existing result workbook has unexpected columns; "
-        "rewriting report table."
-    )
-    return [header]
-
-
-def _conf_status_ok(value: object) -> bool:
-    return str(value or "").strip().lower() == "ok"
-
-
-def product_unit_prefix(value: object) -> str:
-    match = re.match(r"\s*([A-Za-z]+)", str(value or ""))
-    return match.group(1).upper() if match else ""
-
-
-def is_so_unit(value: object) -> bool:
-    return product_unit_prefix(value) == "SO"
-
-
-def status_workbook_path_for_qr(product_dir: Path, qr_code: object) -> Path:
-    return product_dir / "04_Results" / f"{safe_filename_token(qr_code, 'barcode')}_status.xlsx"
-
-
-def done_workbook_path_for_qr(product_dir: Path, qr_code: object) -> Path:
-    return product_dir / "04_Results" / f"{safe_filename_token(qr_code, 'barcode')}_done.xlsx"
-
-
-def eol_sequence_status_from_rows(rows: list[list[object]]) -> tuple[bool, str]:
-    if not rows:
-        return False, "No status workbook rows found."
-
-    header = [str(value) for value in rows[0]]
-    missing = [
-        labels[0]
-        for labels in EOL_SEQUENCE_STEPS
-        if not any(label in header for label in labels)
-    ]
-    if missing:
-        return False, f"Status workbook is missing columns: {', '.join(missing)}."
-
-    completed_step = 0
-    for row in rows[1:]:
-        values = _row_values_by_header(header, row)
-        if completed_step == 0 and any(_conf_status_ok(values.get(label)) for label in EOL_SEQUENCE_STEPS[0]):
-            completed_step = 1
-        if completed_step == 1 and any(_conf_status_ok(values.get(label)) for label in EOL_SEQUENCE_STEPS[1]):
-            completed_step = 2
-        if completed_step == 2 and any(_conf_status_ok(values.get(label)) for label in EOL_SEQUENCE_STEPS[2]):
-            completed_step = 3
-            return True, "EOL enabled: Configuration, Zeroing, and Calibration are OK in sequence."
-
-    labels = ("Configuration", "Zeroing", "Calibration")
-    next_label = labels[min(completed_step, len(labels) - 1)]
-    return False, f"EOL disabled until {next_label} is OK in sequence."
-
-
-def eol_sequence_status_for_product(product_dir: Path | None, qr_code: object) -> tuple[bool, str, str]:
-    if product_dir is None or not str(qr_code or "").strip():
-        return False, "Scan product first.", ""
-
-    done_path = done_workbook_path_for_qr(product_dir, qr_code)
-    if done_path.is_file():
-        return True, f"EOL already done: {done_path.name}", str(done_path)
-
-    path = status_workbook_path_for_qr(product_dir, qr_code)
-    if not path.is_file():
-        return False, f"EOL disabled: status workbook not found: {path.name}", str(path)
-
-    rows = normalize_conf_report_rows(read_conf_xlsx_rows(path))
-    ok, message = eol_sequence_status_from_rows(rows)
-    return ok, message, str(path)
-
-
-def eol_done_report_for_product(product_dir: Path | None, qr_code: object) -> Path | None:
-    if product_dir is None or not str(qr_code or "").strip():
-        return None
-    path = done_workbook_path_for_qr(product_dir, qr_code)
-    return path if path.is_file() else None
-
-
-def _workflow_step_state(value: object) -> str:
-    text = str(value or "").strip()
-    if not text or text == "-":
-        return "idle"
-    return "pass" if _conf_status_ok(text) else "fail"
-
-
-def conf_workflow_status_from_rows(rows: list[list[object]]) -> dict[str, dict[str, str]]:
-    if not rows:
-        return {}
-    header = [str(value) for value in rows[0]]
-    steps = {
-        "load_script_config": ("Configuration",),
-        "start_zeroing": ("Write Zero", "Zeroing"),
-        "start_calibration": ("Calibration",),
-    }
-    status: dict[str, dict[str, str]] = {}
-    for step, labels in steps.items():
-        latest_value = ""
-        latest_date = ""
-        for row in rows[1:]:
-            values = _row_values_by_header(header, row)
-            for label in labels:
-                value = values.get(label, "")
-                clean_value = str(value or "").strip()
-                if clean_value and clean_value != "-":
-                    latest_value = str(value)
-                    latest_date = str(values.get("Date", "") or "")
-        status[step] = {
-            "state": _workflow_step_state(latest_value),
-            "value": latest_value or "-",
-            "time": latest_date or "-",
-        }
-    return status
-
-
-def conf_workflow_status_for_product(
-    product_dir: Path | None,
+def find_product_family_folder_from_roots(
     qr_code: object,
-) -> tuple[dict[str, dict[str, str]], str]:
-    if product_dir is None or not str(qr_code or "").strip():
-        return {}, ""
-    path = status_workbook_path_for_qr(product_dir, qr_code)
-    if not path.is_file():
-        return {}, str(path)
-    rows = normalize_conf_report_rows(read_conf_xlsx_rows(path))
-    return conf_workflow_status_from_rows(rows), str(path)
+    config_data: dict[str, object] | None,
+) -> Path | None:
+    previous_root = product_context_module.MANUFACTURING_ROOT
+    product_context_module.MANUFACTURING_ROOT = MANUFACTURING_ROOT
+    try:
+        return _find_product_family_folder_from_roots(qr_code, config_data)
+    finally:
+        product_context_module.MANUFACTURING_ROOT = previous_root
 
 
 DD_CALIBRATION_BARCODE_MARKERS = (
@@ -438,6 +200,12 @@ DD_CALIBRATION_BARCODE_MARKERS = (
     "1058534",
 )
 TRACTION_CALIBRATION_COLUMNS = (
+    "Date",
+    "Product Number",
+    "Program",
+    "Calibration status",
+)
+LEGACY_TRACTION_CALIBRATION_COLUMNS = (
     "Date",
     "Motor Number",
     "Program",
@@ -464,6 +232,48 @@ def choose_traction_calibration_script(barcode: object) -> Path:
     program = choose_traction_calibration_program(barcode)
     script_name = "DD_Calibration.py" if program == "DD" else "ST_Calibration.py"
     return TRACTION_CALIBRATION_ROOT / script_name
+
+
+def traction_calibration_status_for_product(product_barcode: object) -> tuple[bool, str]:
+    barcode = str(product_barcode or "").strip()
+    if not barcode:
+        return False, "Scan product number first."
+    if is_so_unit(barcode):
+        return False, "Traction calibration is not available for SO units."
+    return True, "Traction calibration available."
+
+
+def eol_availability_status_for_product(
+    product_dir: Path | None,
+    product_barcode: object,
+    product_spec_path: Path | None,
+    product_params: dict[str, object],
+    steering_available: bool | None,
+) -> tuple[bool, str, str]:
+    barcode = str(product_barcode or "").strip()
+    if not barcode:
+        return False, "Scan product first.", ""
+
+    done_path = eol_done_report_for_product(product_dir, barcode)
+    if done_path is not None:
+        return True, f"EOL already done: {done_path.name}", str(done_path)
+
+    if product_dir is None:
+        return False, "EOL disabled: product folder not found.", ""
+    if product_spec_path is None:
+        return False, "EOL disabled: product specification not found.", str(product_dir)
+
+    recipes_ok, recipes_message, recipes_path = validate_eol_recipe_files(
+        product_dir,
+        product_params,
+    )
+    if not recipes_ok:
+        return False, recipes_message, recipes_path
+
+    if steering_available is True:
+        return eol_sequence_status_for_product(product_dir, barcode)
+
+    return True, "EOL enabled: product specification and recipes found.", recipes_path
 
 
 def parse_attempt_9_calibration_zero(output: str) -> tuple[bool, dict[str, int] | None]:
@@ -494,6 +304,94 @@ def parse_attempt_9_calibration_zero(output: str) -> tuple[bool, dict[str, int] 
     return all(attempt_9_params[key] == 0 for key in ("SinOff", "CosOff", "GainC", "Harm4")), attempt_9_params
 
 
+def traction_mhm_interface_failure_detected(output: str) -> bool:
+    text = str(output or "")
+    return (
+        "Failed to set interface" in text
+        or "MHM_SetInterface failed" in text
+        or "eMHM_INTERFACE_NOT_FOUND" in text
+        or "eMHM_INTERFACEDRIVER_NOT_FOUND" in text
+    )
+
+
+def traction_mhm_biss_comm_failure_detected(output: str) -> bool:
+    return "BISSCOMM_FAILED" in str(output or "")
+
+
+def traction_mhm_failure_detected(output: str) -> bool:
+    return (
+        traction_mhm_interface_failure_detected(output)
+        or traction_mhm_biss_comm_failure_detected(output)
+    )
+
+
+def traction_mhm_interface_diagnostic(output: str, lsusb_output: str) -> str:
+    interface_failed = traction_mhm_interface_failure_detected(output)
+    biss_comm_failed = traction_mhm_biss_comm_failure_detected(output)
+    if not interface_failed and not biss_comm_failed:
+        return ""
+
+    usb_lines = [
+        line.strip()
+        for line in str(lsusb_output or "").splitlines()
+        if line.strip()
+    ]
+    expected_ids = ", ".join(
+        f"{name} {usb_id}"
+        for usb_id, name in TRACTION_MHM_USB_ADAPTER_IDS.items()
+    )
+    matched = [
+        f"{name} {usb_id}"
+        for usb_id, name in TRACTION_MHM_USB_ADAPTER_IDS.items()
+        if usb_id.lower() in str(lsusb_output or "").lower()
+    ]
+    visible = "\n".join(f"[INFO]   {line}" for line in usb_lines[:20])
+    if len(usb_lines) > 20:
+        visible += f"\n[INFO]   ... {len(usb_lines) - 20} more USB device(s)"
+
+    parts = []
+    if interface_failed:
+        parts.extend(
+            [
+                "[WARN] MHM interface setup failed before traction calibration.",
+                "[WARN] Manual hint: MHM_SetInterface option is only the MB4U/MB5U serial number last 4 characters; empty is correct when only one adapter is connected.",
+                "[WARN] eMHM_INTERFACE_NOT_FOUND means check adapter USB/cable/power supply or driver version.",
+                "[WARN] eMHM_INTERFACEDRIVER_NOT_FOUND means install/check the FTDI or libusb adapter driver.",
+            ]
+        )
+    if biss_comm_failed:
+        parts.extend(
+            [
+                "[WARN] MHM BiSS communication failed during traction calibration.",
+                "[WARN] The adapter/interface opened, but the MHM could not communicate with the encoder over BiSS.",
+                "[WARN] Manual checks: verify adapter-to-iC-MHM wiring, encoder power, connector seating, BiSS/SSI mode, and that no other process is using the adapter.",
+            ]
+        )
+
+    parts.append(f"[INFO] Expected Linux USB adapters: {expected_ids}.")
+    if matched:
+        parts.append(f"[INFO] Detected expected MHM adapter(s): {', '.join(matched)}.")
+    else:
+        parts.append("[WARN] No expected MHM adapter USB ID was found in lsusb output.")
+    if visible:
+        parts.append("[INFO] Visible USB devices:")
+        parts.append(visible)
+    return "\n".join(parts)
+
+
+def traction_lsusb_output() -> str:
+    try:
+        result = subprocess.run(
+            ["lsusb"],
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+    except Exception as exc:
+        return f"lsusb unavailable: {exc}"
+    return result.stdout or result.stderr or ""
+
+
 def append_traction_calibration_log(
     *,
     workbook_path: Path,
@@ -504,16 +402,28 @@ def append_traction_calibration_log(
 ) -> None:
     rows = read_conf_xlsx_rows(workbook_path)
     header = list(TRACTION_CALIBRATION_COLUMNS)
-    if not rows or rows[0] != header:
+    if not rows:
         rows = [header]
+    else:
+        existing_header = [str(value) for value in rows[0]]
+        if existing_header == list(TRACTION_CALIBRATION_COLUMNS):
+            rows[0] = header
+        elif existing_header == list(LEGACY_TRACTION_CALIBRATION_COLUMNS):
+            rows = [header, *rows[1:]]
+        else:
+            print(
+                "[WARN] Existing traction calibration workbook has unexpected columns; "
+                "rewriting report table."
+            )
+            rows = [header]
     rows.append([calibration_date, barcode, program, status])
     write_conf_xlsx_rows(workbook_path, rows)
 
 
-def run_traction_calibration(motor_barcode: object) -> bool:
-    barcode = str(motor_barcode or "").strip()
+def run_traction_calibration(product_barcode: object) -> bool:
+    barcode = str(product_barcode or "").strip()
     if not barcode:
-        raise RuntimeError("Motor barcode is required for traction calibration.")
+        raise RuntimeError("Product number is required for traction calibration.")
 
     script_path = choose_traction_calibration_script(barcode)
     program = choose_traction_calibration_program(barcode)
@@ -521,10 +431,17 @@ def run_traction_calibration(motor_barcode: object) -> bool:
         raise FileNotFoundError(f"Traction calibration script not found: {script_path}")
 
     print(f"[INFO] Running traction calibration program: {program} ({script_path.name})")
-    print(f"[INFO] Motor barcode: {barcode}")
+    print(f"[INFO] Product number: {barcode}")
+    subprocess_env = os.environ.copy()
+    mhm_interface = subprocess_env.setdefault(
+        "MHM_INTERFACE",
+        TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE,
+    )
+    print(f"[INFO] Traction MHM interface: {mhm_interface}")
     completed = subprocess.run(
         [sys.executable, str(script_path)],
         cwd=str(TRACTION_CALIBRATION_ROOT),
+        env=subprocess_env,
         text=True,
         capture_output=True,
         check=False,
@@ -534,9 +451,15 @@ def run_traction_calibration(motor_barcode: object) -> bool:
     if completed.stderr:
         print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n")
 
-    attempt_zero, attempt_params = parse_attempt_9_calibration_zero(
-        f"{completed.stdout}\n{completed.stderr}"
+    completed_output = f"{completed.stdout}\n{completed.stderr}"
+    diagnostic = traction_mhm_interface_diagnostic(
+        completed_output,
+        traction_lsusb_output() if traction_mhm_failure_detected(completed_output) else "",
     )
+    if diagnostic:
+        print(diagnostic)
+
+    attempt_zero, attempt_params = parse_attempt_9_calibration_zero(completed_output)
     status = "PASS" if completed.returncode == 0 and attempt_zero else "FAIL"
     append_traction_calibration_log(
         workbook_path=TRACTION_CALIBRATION_WORKBOOK,
@@ -553,378 +476,6 @@ def run_traction_calibration(motor_barcode: object) -> bool:
     return status == "PASS"
 
 
-class RunAllReport:
-    def __init__(self, product_dir: Path, qr_code: object, node: int, desired_angle: float):
-        timestamp = datetime.now()
-        self.qr_code = str(qr_code or "")
-        self.product_dir = product_dir
-        result_dir = product_dir / "04_Results"
-        filename = f"{safe_filename_token(qr_code, 'barcode')}_status.xlsx"
-        self.path = result_dir / filename
-        rows = normalize_conf_report_rows(read_conf_xlsx_rows(self.path))
-        header = list(RUN_ALL_REPORT_COLUMNS)
-        self.rows = rows
-        self.values = {
-            "Date": timestamp.strftime("%Y-%m-%d %H:%M:%S"),
-            "Serial number": "-",
-            "Configuration": "-",
-            "Write Zero": "-",
-            "Calibration": "-",
-        }
-        self.row_idx = len(self.rows)
-        self.rows.append(self._values_to_row())
-        self.save()
-
-    def update(self, **values: object) -> None:
-        changed = False
-        for key, value in values.items():
-            if key not in RUN_ALL_REPORT_COLUMNS:
-                continue
-            text_value = "" if value is None else str(value)
-            if str(self.values.get(key, "")) != text_value:
-                self.values[key] = text_value
-                changed = True
-        if changed:
-            self.rows[self.row_idx] = self._values_to_row()
-            self.save()
-
-    def _values_to_row(self) -> list[str]:
-        return [str(self.values.get(column, "")) for column in RUN_ALL_REPORT_COLUMNS]
-
-    def save(self) -> None:
-        write_conf_xlsx_rows(self.path, self.rows)
-
-
-@dataclass(frozen=True)
-class ProductContext:
-    qr_code: str
-    product_dir: Path
-    can_bitrate: int
-    steering_node_id: int
-    zero_angle: float
-    script_path: Path
-
-    def script_info(self) -> dict[str, object]:
-        return {
-            "qr_code": self.qr_code,
-            "product_dir": str(self.product_dir),
-            "script_path": str(self.script_path),
-        }
-
-
-@dataclass(frozen=True)
-class ProductSpecCache:
-    qr_code: str
-    product_dir: Path
-    spec_path: Path
-    params: dict[str, object]
-    context: ProductContext | None
-    steering_available: bool
-    message: str
-
-
-def _xlsx_text(node: ET.Element | None) -> str:
-    if node is None:
-        return ""
-    return "".join(node.itertext())
-
-
-def read_product_spec_parameters(path: Path) -> dict[str, object]:
-    if not path.is_file():
-        raise FileNotFoundError(f"Product specification not found: {path}")
-
-    ns = {
-        "x": "http://schemas.openxmlformats.org/spreadsheetml/2006/main",
-        "r": "http://schemas.openxmlformats.org/officeDocument/2006/relationships",
-    }
-    params: dict[str, object] = {}
-    with zipfile.ZipFile(path) as archive:
-        shared: list[str] = []
-        if "xl/sharedStrings.xml" in archive.namelist():
-            root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
-            shared = [_xlsx_text(si) for si in root.findall("x:si", ns)]
-
-        workbook = ET.fromstring(archive.read("xl/workbook.xml"))
-        rels = ET.fromstring(archive.read("xl/_rels/workbook.xml.rels"))
-        targets = {rel.attrib["Id"]: rel.attrib["Target"] for rel in rels}
-
-        for sheet in workbook.findall("x:sheets/x:sheet", ns):
-            rel_id = sheet.attrib.get(
-                "{http://schemas.openxmlformats.org/officeDocument/2006/relationships}id"
-            )
-            if not rel_id or rel_id not in targets:
-                continue
-            target = targets[rel_id].lstrip("/")
-            if not target.startswith("xl/"):
-                target = f"xl/{target}"
-            root = ET.fromstring(archive.read(target))
-            for row in root.findall(".//x:sheetData/x:row", ns):
-                values: list[object] = []
-                for cell in row.findall("x:c", ns):
-                    value = cell.find("x:v", ns)
-                    inline = cell.find("x:is", ns)
-                    if cell.attrib.get("t") == "s" and value is not None:
-                        values.append(shared[int(value.text or "0")])
-                    elif cell.attrib.get("t") == "inlineStr":
-                        values.append(_xlsx_text(inline))
-                    elif value is not None:
-                        values.append(value.text or "")
-                    else:
-                        values.append("")
-                if len(values) >= 2 and str(values[0]).strip():
-                    params[str(values[0]).strip()] = values[1]
-    return params
-
-
-def _require_int_param(params: dict[str, object], key: str, minimum: int, maximum: int) -> int:
-    raw = params.get(key)
-    if raw is None or str(raw).strip() == "":
-        raise ValueError(f"Missing required product specification value: {key}")
-    try:
-        value = int(float(str(raw).strip()))
-    except ValueError as exc:
-        raise ValueError(f"Invalid product specification value for {key}: {raw!r}") from exc
-    if not minimum <= value <= maximum:
-        raise ValueError(
-            f"Product specification value {key} must be between {minimum} and {maximum}: {value}"
-        )
-    return value
-
-
-def _require_float_param(params: dict[str, object], key: str) -> float:
-    raw = params.get(key)
-    if raw is None or str(raw).strip() == "":
-        raise ValueError(f"Missing required product specification value: {key}")
-    try:
-        return float(str(raw).strip())
-    except ValueError as exc:
-        raise ValueError(f"Invalid product specification value for {key}: {raw!r}") from exc
-
-
-def find_product_spec_path(product_dir: Path) -> Path:
-    direct = product_dir / "ProductSpecifications_V2.xlsx"
-    if direct.is_file():
-        return direct
-
-    child_matches = sorted(product_dir.glob("*/ProductSpecifications_V2.xlsx"))
-    if child_matches:
-        return child_matches[0]
-
-    nested_matches = sorted(product_dir.rglob("ProductSpecifications_V2.xlsx"))
-    if nested_matches:
-        return nested_matches[0]
-
-    raise FileNotFoundError(
-        f"Product specification not found under product folder: {product_dir}"
-    )
-
-
-def _normalized_product_key(value: object) -> str:
-    return re.sub(r"[^A-Za-z0-9]+", "", str(value or "")).upper()
-
-
-def resolve_product_family_dir(
-    qr_code: object,
-    product_dir_raw: Path | str,
-    product_base: Path | str | None,
-) -> Path:
-    product_dir = Path(product_dir_raw).expanduser().resolve()
-    if product_base is None:
-        return product_dir
-
-    base_dir = Path(product_base).expanduser().resolve()
-    try:
-        relative_parts = product_dir.relative_to(base_dir).parts
-    except ValueError:
-        return product_dir
-
-    if not relative_parts:
-        return product_dir
-
-    family_dir = base_dir / relative_parts[0]
-    qr_key = _normalized_product_key(qr_code)
-    family_key = _normalized_product_key(family_dir.name)
-    if family_key and qr_key.startswith(family_key):
-        return family_dir
-    return product_dir
-
-
-def configured_product_base_path(config_data: dict[str, object] | None) -> Path | None:
-    if not isinstance(config_data, dict):
-        return None
-    paths = config_data.get("paths", {})
-    if not isinstance(paths, dict):
-        return None
-    product_base = paths.get("product_base")
-    if not product_base:
-        return None
-    return Path(str(product_base))
-
-
-def product_family_name_from_qr(qr_code: object) -> str:
-    parts = str(qr_code or "").strip().split("-")
-    if len(parts) >= 2 and parts[0] and parts[1]:
-        return "-".join(parts[:2])
-    return str(qr_code or "").strip()
-
-
-def product_search_roots(config_data: dict[str, object] | None) -> list[Path]:
-    roots: list[Path] = []
-    configured_root = configured_product_base_path(config_data)
-    if configured_root is not None:
-        roots.append(configured_root)
-        roots.append(configured_root / "01_Products")
-    roots.append(MANUFACTURING_ROOT / "01_Products")
-    roots.append(MANUFACTURING_ROOT)
-
-    unique: list[Path] = []
-    seen: set[str] = set()
-    for root in roots:
-        key = os.fspath(root.expanduser())
-        if key not in seen:
-            unique.append(root)
-            seen.add(key)
-    return unique
-
-
-def find_product_family_folder_from_roots(
-    qr_code: object,
-    config_data: dict[str, object] | None,
-) -> Path | None:
-    qr_key = _normalized_product_key(qr_code)
-    family_name = product_family_name_from_qr(qr_code)
-    family_key = _normalized_product_key(family_name)
-    for root in product_search_roots(config_data):
-        root = root.expanduser()
-        if not root.is_dir():
-            continue
-
-        direct_candidates = [root / family_name] if family_name else []
-        try:
-            direct_candidates.extend(
-                child for child in root.iterdir() if child.is_dir()
-            )
-        except OSError:
-            continue
-
-        matches = []
-        for candidate in direct_candidates:
-            if not candidate.is_dir():
-                continue
-            candidate_key = _normalized_product_key(candidate.name)
-            if candidate_key and (
-                qr_key.startswith(candidate_key)
-                or (family_key and candidate_key == family_key)
-            ):
-                matches.append(candidate)
-        if matches:
-            return max(matches, key=lambda path: len(path.name)).resolve()
-    return None
-
-
-def _product_value_present(value: object) -> bool:
-    text = str(value or "").strip()
-    return bool(text) and text.lower() not in {"nan", "none", "null", "-"}
-
-
-def has_steering_information(params: dict[str, object]) -> bool:
-    if not _product_value_present(params.get("Steering Controller Type")):
-        return False
-    try:
-        _require_int_param(params, "Steering Node ID", 1, 127)
-    except Exception:
-        return False
-    return True
-
-
-def resolve_product_scan_text(scan_text: object) -> ProductSpecCache:
-    from io_helpers import find_product_folder
-
-    qr_code = str(scan_text or "").strip()
-    if not qr_code:
-        raise RuntimeError("Product code is empty.")
-
-    old_cwd = os.getcwd()
-    try:
-        product_dir_raw = find_product_folder.find_config(qr_code)
-    finally:
-        try:
-            os.chdir(old_cwd)
-        except Exception:
-            pass
-    product_base = configured_product_base_path(getattr(find_product_folder, "config", None))
-    if not product_dir_raw:
-        product_dir = find_product_family_folder_from_roots(
-            qr_code,
-            getattr(find_product_folder, "config", None),
-        )
-        if product_dir is None:
-            raise RuntimeError(f"No product folder found for QR code: {qr_code}")
-    else:
-        product_dir = resolve_product_family_dir(
-            qr_code,
-            Path(product_dir_raw),
-            product_base,
-        )
-    spec_path = find_product_spec_path(product_dir)
-    params = read_product_spec_parameters(spec_path)
-
-    if not has_steering_information(params):
-        message = (
-            f"{qr_code}: product specification has no steering information. "
-            "Steering tab disabled."
-        )
-        print(f"[INFO] {message}")
-        return ProductSpecCache(
-            qr_code=str(qr_code),
-            product_dir=product_dir,
-            spec_path=spec_path,
-            params=params,
-            context=None,
-            steering_available=False,
-            message=message,
-        )
-
-    can_bitrate = _require_int_param(params, "CAN Baudrate", 1, 1000)
-    steering_node_id = _require_int_param(params, "Steering Node ID", 1, 127)
-    zero_angle = _require_float_param(params, "Zero angle")
-    script_path = product_dir / "01_SwConfiguration" / "SteeringScript.py"
-    if not script_path.is_file():
-        raise FileNotFoundError(f"SteeringScript.py not found: {script_path}")
-
-    context = ProductContext(
-        qr_code=str(qr_code),
-        product_dir=product_dir,
-        can_bitrate=can_bitrate,
-        steering_node_id=steering_node_id,
-        zero_angle=zero_angle,
-        script_path=script_path,
-    )
-    print(
-        "[INFO] Product context -> "
-        f"qr={context.qr_code} product_dir={context.product_dir} "
-        f"bitrate={context.can_bitrate} node={context.steering_node_id} "
-        f"zero_angle={context.zero_angle:.2f}"
-    )
-    return ProductSpecCache(
-        qr_code=str(qr_code),
-        product_dir=product_dir,
-        spec_path=spec_path,
-        params=params,
-        context=context,
-        steering_available=True,
-        message=f"{context.qr_code}: steering product specification loaded.",
-    )
-
-
-def scan_product_context() -> ProductSpecCache:
-    from drivers.driver_QRreader import run_qr_reader
-
-    print("[INFO] Scanning product QR code.")
-    qr_code = run_qr_reader(show=True, once=True, return_first=True)
-    if not qr_code:
-        raise RuntimeError("QR code could not be read from camera.")
-    return resolve_product_scan_text(qr_code)
 
 
 def get_cached_or_scan_product_context() -> ProductContext:
@@ -968,7 +519,7 @@ class AppState:
         self._quality_fields: dict[str, str] = {}
         self.status_lines: list[str] = ["Switch On Power Supply"]
         self.activity_label = "Switch On Power Supply"
-        self.activity_step = "Power and CAN are required before steering tasks."
+        self.activity_step = "Run a task to switch relays and connect CAN automatically."
         self.activity_state = "idle"
         self.has_error = False
         self.running = False
@@ -987,6 +538,11 @@ class AppState:
         self.relay_connecting = False
         self.relay_connection_ok: bool | None = None
         self.relay_connection_message = "Relay Arduino not connected yet."
+        self.relay_mode = RELAY_MODE_AUTOMATIC
+        self.awaiting_relay_confirmation = False
+        self.relay_confirmation_action = ""
+        self.relay_confirmation_task = ""
+        self._relay_confirmation_event = threading.Event()
         self.controller_enabled = False
         self.controller_error_code: int | None = None
         self.controller_error_active = False
@@ -1225,26 +781,25 @@ class AppState:
         with self.lock:
             product_dir = self.current_product_dir
             product_qr_code = self.current_barcode
+            product_spec_path = self.current_product_spec_path
+            product_params = dict(self.current_product_params)
+            steering_available = self.steering_available
         unit_is_so = is_so_unit(product_qr_code)
-        traction_available = bool(product_qr_code) and not unit_is_so
+        traction_available, traction_status_message = traction_calibration_status_for_product(
+            product_qr_code
+        )
         conf_workflow_status, conf_status_path = conf_workflow_status_for_product(
             product_dir,
             product_qr_code,
         )
         eol_done_report_path = eol_done_report_for_product(product_dir, product_qr_code)
-        if unit_is_so:
-            eol_available, eol_status_message, eol_status_path = eol_sequence_status_for_product(
-                product_dir,
-                product_qr_code,
-            )
-        else:
-            eol_available = False
-            eol_status_message = (
-                "EOL disabled for non-SO units."
-                if product_qr_code
-                else "Scan product first."
-            )
-            eol_status_path = ""
+        eol_available, eol_status_message, eol_status_path = eol_availability_status_for_product(
+            product_dir,
+            product_qr_code,
+            product_spec_path,
+            product_params,
+            steering_available,
+        )
         with self.lock:
             return {
                 "log": self.log,
@@ -1270,6 +825,10 @@ class AppState:
                 "relay_connecting": self.relay_connecting,
                 "relay_connection_ok": self.relay_connection_ok,
                 "relay_connection_message": self.relay_connection_message,
+                "relay_mode": self.relay_mode,
+                "awaiting_relay_confirmation": self.awaiting_relay_confirmation,
+                "relay_confirmation_action": self.relay_confirmation_action,
+                "relay_confirmation_task": self.relay_confirmation_task,
                 "controller_power_relays_on": controller_power_on,
                 "product_scan_running": self.product_scan_running,
                 "product_scan_completed": self.product_scan_completed,
@@ -1286,6 +845,7 @@ class AppState:
                 ),
                 "steering_available": self.steering_available,
                 "traction_available": traction_available,
+                "traction_status_message": traction_status_message,
                 "eol_available": eol_available,
                 "eol_status_message": eol_status_message,
                 "eol_status_path": eol_status_path or conf_status_path,
@@ -1322,6 +882,8 @@ class AppState:
                 self._update_controller_error_state_locked(error_code)
 
     def request_power_cycle_confirmation(self, timeout_s: float) -> bool:
+        if os.getenv("ST_NONINTERACTIVE"):
+            raise RuntimeError("Power-cycle confirmation is unavailable in non-interactive mode.")
         self._power_cycle_event.clear()
         with self.lock:
             self.awaiting_power_cycle = True
@@ -1343,6 +905,55 @@ class AppState:
         self._power_cycle_event.set()
         return True
 
+    def set_relay_mode(self, mode: str) -> None:
+        parsed_mode = parse_relay_mode(mode)
+        with self.lock:
+            self.relay_mode = parsed_mode
+            self.status_lines = [f"Relay mode set to {parsed_mode}."]
+            self.activity_label = "Relay mode"
+            self.activity_step = self.status_lines[0]
+            self.activity_state = "idle"
+
+    def request_relay_confirmation(
+        self,
+        action: str,
+        task_label: str,
+        timeout_s: float,
+    ) -> bool:
+        if os.getenv("ST_NONINTERACTIVE"):
+            raise RuntimeError("Manual relay confirmation is unavailable in non-interactive mode.")
+
+        action_text = "activate" if action == "activate" else "deactivate"
+        instruction = (
+            f"Manually {action_text} task relays for {task_label}, "
+            "then press Continue."
+        )
+        self._relay_confirmation_event.clear()
+        with self.lock:
+            self.awaiting_relay_confirmation = True
+            self.relay_confirmation_action = action_text
+            self.relay_confirmation_task = task_label
+            self.status = "Waiting for relay confirmation."
+            self.activity_label = "Manual relay confirmation"
+            self.activity_step = instruction
+            self.activity_state = "running"
+            self.status_lines = [instruction]
+        try:
+            return self._relay_confirmation_event.wait(timeout_s)
+        finally:
+            with self.lock:
+                self.awaiting_relay_confirmation = False
+                self.relay_confirmation_action = ""
+                self.relay_confirmation_task = ""
+
+    def confirm_relay_step(self) -> bool:
+        with self.lock:
+            if not self.awaiting_relay_confirmation:
+                return False
+        self.append_status("Relay step confirmed. Continuing.")
+        self._relay_confirmation_event.set()
+        return True
+
     def start_task(
         self,
         task_id: str,
@@ -1361,14 +972,24 @@ class AppState:
         with self.lock:
             product_dir = self.current_product_dir
             product_qr_code = self.current_barcode
-        if task_id == "traction_calibration" and is_so_unit(product_qr_code):
-            return False, "Traction calibration is disabled for SO units."
+            product_spec_path = self.current_product_spec_path
+            product_params = dict(self.current_product_params)
+            steering_available = self.steering_available
+        if task_id in STEERING_TASK_IDS and steering_available is not True:
+            if str(product_qr_code or "").strip():
+                return False, "Steering is not available for this product."
+            return False, "Scan a steering product before starting steering tasks."
+        if task_id == "traction_calibration":
+            traction_ok, traction_message = traction_calibration_status_for_product(product_qr_code)
+            if not traction_ok:
+                return False, traction_message
         if task_id == "run_eol":
-            if not is_so_unit(product_qr_code):
-                return False, "EOL is enabled only for SO units after steering preparation."
-            eol_ok, eol_message, _eol_path = eol_sequence_status_for_product(
+            eol_ok, eol_message, _eol_path = eol_availability_status_for_product(
                 product_dir,
                 product_qr_code,
+                product_spec_path,
+                product_params,
+                steering_available,
             )
             if not eol_ok:
                 return False, eol_message
@@ -1389,6 +1010,10 @@ class AppState:
             self.has_error = False
             self.awaiting_power_cycle = False
             self._power_cycle_event.clear()
+            self.awaiting_relay_confirmation = False
+            self.relay_confirmation_action = ""
+            self.relay_confirmation_task = ""
+            self._relay_confirmation_event.clear()
             can_to_close = self._detach_manual_controller_locked(
                 message=f"Running: {TASKS[task_id]}"
             )
@@ -1630,44 +1255,64 @@ class AppState:
     def set_scan_option(self, scan_option: str) -> None:
         if scan_option not in SCAN_OPTIONS:
             raise ValueError(f"Unknown scan option: {scan_option}")
-        should_start_camera_scan = False
         with self.lock:
-            option_changed = self.scan_option != scan_option
             self.scan_option = scan_option
-            if option_changed and not self.product_scan_running:
-                self.product_scan_completed = False
+            if not self.product_scan_running:
                 self.awaiting_product_scan = False
-                self.product_scan_error = ""
-                self.product_scan_message = "Scan option changed. Scan product code."
-                self.steering_available = None
-                self.current_product_context = None
-                self.current_product_params = {}
-                self.current_product_spec_path = None
-                self.current_product_dir = None
-                self.current_barcode = ""
-                self.current_report = None
-                self.activity_label = "Product scan"
-                self.activity_step = "Scan option changed. Scan product code."
-                self.activity_state = "idle"
-                self.status_lines = [self.activity_step]
-            if (
-                scan_option == SCAN_OPTION_QR_CAMERA
-                and self.relay_connection_ok is True
-                and not self.product_scan_completed
-                and not self.product_scan_running
-            ):
-                self.awaiting_product_scan = False
-                should_start_camera_scan = True
-            elif (
-                scan_option != SCAN_OPTION_QR_CAMERA
-                and self.relay_connection_ok is True
-                and not self.product_scan_completed
-                and not self.product_scan_running
-            ):
-                self.awaiting_product_scan = True
-                self.product_scan_message = "Scan product code."
-        if should_start_camera_scan:
-            threading.Thread(target=run_product_scan_and_can_check, args=(None,), daemon=True).start()
+                if not self.product_scan_completed:
+                    self.product_scan_error = ""
+                    self.product_scan_message = "Scan option set. Click Rescan to scan product code."
+                    self.activity_label = "Product scan"
+                    self.activity_step = self.product_scan_message
+                    self.activity_state = "idle"
+                    self.status_lines = [self.activity_step]
+
+    def prepare_product_rescan(
+        self,
+        scan_option: str,
+        *,
+        awaiting_input: bool = False,
+    ) -> tuple[bool, str, object | None]:
+        if scan_option not in SCAN_OPTIONS:
+            raise ValueError(f"Unknown scan option: {scan_option}")
+        with self.lock:
+            if self.running:
+                return False, "Another operation is already running.", None
+            if self.product_scan_running:
+                return False, "Product scan is already running.", None
+            if self.can_check_running:
+                return False, "CAN check is still running.", None
+            if self.manual_requests_in_flight > 0:
+                return False, "A controller command is still finishing.", None
+
+            can_to_close = self._detach_manual_controller_locked(
+                message="CAN disconnected for product rescan."
+            )
+            self.scan_option = scan_option
+            self.product_scan_running = False
+            self.product_scan_completed = False
+            self.awaiting_product_scan = awaiting_input
+            self.product_scan_error = ""
+            self.steering_available = None
+            self.current_product_context = None
+            self.current_product_params = {}
+            self.current_product_spec_path = None
+            self.current_product_dir = None
+            self.current_barcode = ""
+            self.current_report = None
+            if awaiting_input:
+                message = "Scan product code."
+            elif scan_option == SCAN_OPTION_QR_CAMERA:
+                message = "Starting QR camera product scan..."
+            else:
+                message = "Loading product specification..."
+            self.product_scan_message = message
+            self.activity_label = "Product rescan"
+            self.activity_step = message
+            self.activity_state = "idle"
+            self.status_lines = [self.activity_step]
+            self.has_error = False
+            return True, "", can_to_close
 
     def close_manual_controller(self) -> None:
         with self.lock:
@@ -1889,11 +1534,30 @@ class AppState:
         label = TASKS[task_id]
         writer = QueueWriter(self)
         started_at = time.monotonic()
+        cleanup_error: Exception | None = None
         try:
             with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
-                result = run_task(task_id, task_options=task_options)
+                with self.lock:
+                    relay_mode = self.relay_mode
+                relay_lifecycle = TaskRelayLifecycle(
+                    task_id=task_id,
+                    task_label=label,
+                    relay_mode=relay_mode,
+                    activate_automatic=activate_operation_relays_for_task,
+                    deactivate_automatic=deactivate_operation_relays_for_task,
+                    wait_for_manual_step=wait_for_manual_operation_relay_step,
+                )
+                try:
+                    relay_lifecycle.before_task()
+                    result = run_task(task_id, task_options=task_options)
+                finally:
+                    try:
+                        relay_lifecycle.after_task()
+                    except Exception as exc:
+                        cleanup_error = exc
+                        print(format_exc())
             elapsed = time.monotonic() - started_at
-            success = is_success(result)
+            success = is_success(result) and cleanup_error is None
             if success:
                 self.append_log(f"\n=== {label} finished in {elapsed:.1f}s ===\n")
                 self.finish_activity(label, f"Finished in {elapsed:.1f}s.", True)
@@ -1901,17 +1565,28 @@ class AppState:
                 self.append_log(
                     f"\n=== {label} finished with result {result!r} in {elapsed:.1f}s ===\n"
                 )
-                self.finish_activity(label, "Finished with errors. Open Debug for details.", False)
+                if cleanup_error is not None:
+                    self.finish_activity(
+                        label,
+                        "Finished, but task relays could not be deactivated. Open Debug.",
+                        False,
+                    )
+                else:
+                    self.finish_activity(label, "Finished with errors. Open Debug for details.", False)
                 if task_id in {"start_calibration", "test_calibration", "run_all"}:
                     self.mark_quality_failed_if_pending("calibration stopped before final quality report")
             with self.lock:
                 self.status = "Ready." if success else "Finished with errors."
                 if success:
                     self.has_error = False
-        except Exception:
+        except Exception as exc:
             self.append_log(format_exc())
             self.append_log(f"\n=== {label} failed ===\n")
-            self.finish_activity(label, "Failed. Open Debug for details.", False)
+            message = str(exc)
+            if "operation relays" in message.lower() or "task relays" in message.lower():
+                self.finish_activity(label, message, False)
+            else:
+                self.finish_activity(label, "Failed. Open Debug for details.", False)
             if task_id in {"start_calibration", "test_calibration", "run_all"}:
                 self.mark_quality_failed_if_pending("calibration failed before final quality report")
             with self.lock:
@@ -2172,7 +1847,11 @@ def steering_can_candidates(context: ProductContext) -> list[tuple[int, int, str
     return candidates
 
 
-def _check_configuration_can_candidates(context: ProductContext) -> tuple[bool, list[str]]:
+def _check_configuration_can_candidates(
+    context: ProductContext,
+    *,
+    allow_interface_recovery: bool = True,
+) -> tuple[bool, list[str]]:
     failures: list[str] = []
     for node, bitrate, label, candidate_context in steering_can_candidates(context):
         print(f"[INFO] Configuration CAN preflight trying {label}: node {node}, {bitrate} kbit/s.")
@@ -2186,69 +1865,137 @@ def _check_configuration_can_candidates(context: ProductContext) -> tuple[bool, 
             print(f"[INFO] Configuration CAN preflight accepted {label}: {message}")
             return True, failures
         failures.append(f"{label}: {message}")
+
+    if allow_interface_recovery and failures:
+        recovery_failure = failures[-1]
+        recovery_ok, recovery_message = recover_can_interface_after_failure(
+            first_failure=recovery_failure,
+            can_bitrate=context.can_bitrate,
+        )
+        STATE.append_status(recovery_message, is_error=not recovery_ok, mark_error=False)
+        if recovery_ok:
+            time.sleep(ST_CAN_SERVICE_RESTART_SETTLE_S)
+            return _check_configuration_can_candidates(
+                context,
+                allow_interface_recovery=False,
+            )
+        failures.append(f"CAN interface recovery: {recovery_message}")
+
     print("[WARN] Configuration CAN preflight failed after trying all steering CAN candidates.")
     return False, failures
 
 
 def ensure_controller_ready_for_configuration(context: ProductContext) -> None:
-    connected, failures = _check_configuration_can_candidates(context)
-    if connected:
-        return
+    ensure_task_can_connected(context, "Configuration", allow_standard_node=True)
 
-    print("[STATUS] Controller not reachable on node 59 or product node before Configuration; restarting with relays.")
-    try:
-        ok, restart_message = restart_controller_with_relays(
-            node=None,
-            can_bitrate=None,
-            context=None,
-            reconnect=False,
-            off_seconds=CONTROLLER_POWER_CYCLE_OFF_S,
+
+def ensure_controller_ready_for_task(
+    context: ProductContext,
+    task_label: str,
+    *,
+    allow_standard_node: bool = False,
+) -> None:
+    ensure_task_can_connected(
+        context,
+        task_label,
+        allow_standard_node=allow_standard_node,
+    )
+
+
+def task_can_connection_candidates(
+    context: ProductContext,
+    *,
+    allow_standard_node: bool = False,
+) -> list[tuple[int, int, str, ProductContext]]:
+    if allow_standard_node:
+        return steering_can_candidates(context)
+    return [
+        (
+            context.steering_node_id,
+            context.can_bitrate,
+            "product specification node",
+            context,
         )
-    except Exception as exc:
-        ok = False
-        restart_message = f"Relay controller restart failed: {exc}"
-    STATE.append_status(restart_message, is_error=not ok, mark_error=False)
-    if ok:
-        connected, failures = _check_configuration_can_candidates(context)
-        if connected:
-            return
+    ]
 
-    reason = (
-        "Controller is not reachable on standard node 59 or product specification "
-        f"node {context.steering_node_id} before Configuration."
+
+def ensure_task_can_connected(
+    context: ProductContext,
+    task_label: str,
+    *,
+    allow_standard_node: bool = False,
+) -> None:
+    node = context.steering_node_id
+    bitrate = context.can_bitrate
+    candidates = task_can_connection_candidates(
+        context,
+        allow_standard_node=allow_standard_node,
     )
-    if wait_for_manual_restart_and_reconnect(context, reason):
-        connected, failures = _check_configuration_can_candidates(context)
+    with STATE.lock:
+        current_key = (STATE.can_connection_node, STATE.can_connection_bitrate)
+        candidate_keys = {
+            (candidate_node, candidate_bitrate)
+            for candidate_node, candidate_bitrate, *_ in candidates
+        }
+        already_connected = (
+            STATE.can_connection_ok is True
+            and current_key in candidate_keys
+            and STATE.manual_mic is not None
+        )
+    if already_connected:
+        print(
+            f"[INFO] CAN already connected for {task_label}: "
+            f"node {current_key[0]}, {current_key[1]} kbit/s."
+        )
+        return
+
+    STATE.set_activity(step="Connecting CAN after relays...", state="running", mark_error=False)
+    _detach_manual_can_for_power_change(f"Connecting CAN for {task_label}...")
+
+    failures: list[str] = []
+    for candidate_node, candidate_bitrate, label, candidate_context in candidates:
+        print(
+            f"[STATUS] Connecting CAN for {task_label} using {label}: "
+            f"node {candidate_node}, {candidate_bitrate} kbit/s."
+        )
+        connected, message = check_can_connection(
+            candidate_node,
+            can_bitrate=candidate_bitrate,
+            create_report=False,
+            context=candidate_context,
+        )
         if connected:
+            STATE.append_status(message, mark_error=False)
             return
+        failures.append(f"{label}: {message}")
+
+    recovery_failure = failures[-1] if failures else ""
+    recovery_ok, recovery_message = recover_can_interface_after_failure(
+        first_failure=recovery_failure,
+        can_bitrate=bitrate,
+    )
+    STATE.append_status(recovery_message, is_error=not recovery_ok, mark_error=False)
+    if recovery_ok:
+        time.sleep(ST_CAN_SERVICE_RESTART_SETTLE_S)
+        for candidate_node, candidate_bitrate, label, candidate_context in candidates:
+            print(
+                f"[STATUS] Retrying CAN for {task_label} using {label}: "
+                f"node {candidate_node}, {candidate_bitrate} kbit/s."
+            )
+            connected, message = check_can_connection(
+                candidate_node,
+                can_bitrate=candidate_bitrate,
+                create_report=False,
+                context=candidate_context,
+            )
+            if connected:
+                STATE.append_status(f"{recovery_message} {message}", mark_error=False)
+                return
+            failures.append(f"retry {label}: {message}")
 
     raise RuntimeError(
-        "Could not add CAN node 59 or product specification node "
-        f"{context.steering_node_id} before Configuration. "
-        + " | ".join(failures)
-    )
-
-
-def ensure_controller_ready_for_task(context: ProductContext, task_label: str) -> None:
-    connected, failures = _check_configuration_can_candidates(context)
-    if connected:
-        return
-
-    print(f"[WARN] Controller is not reachable before {task_label}: {' | '.join(failures)}")
-    if restart_controller_with_relays_for_task(
-        context,
-        f"Controller is not reachable before {task_label}.",
-    ):
-        return
-
-    if wait_for_manual_restart_and_reconnect(
-        context,
-        f"Controller is not reachable before {task_label}.",
-    ):
-        return
-
-    raise RuntimeError(
-        f"Could not add CAN node 59 or product node {context.steering_node_id} before {task_label}."
+        f"CAN connection failed before {task_label}: "
+        + " | ".join([*failures, f"CAN interface recovery: {recovery_message}"])
     )
 
 
@@ -2276,8 +2023,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
                     product_barcode = str(STATE.current_barcode or "").strip()
         if not product_barcode:
             raise RuntimeError("Product barcode is required for EOL.")
-        if not product_barcode.upper().startswith("SO-1000"):
-            raise RuntimeError("Product barcode must start with SO-1000.")
         if not motor_barcode and is_so_unit(product_barcode):
             motor_barcode = "0"
         if not motor_barcode:
@@ -2293,9 +2038,15 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
         )
 
     if task_id == "traction_calibration":
+        product_barcode = str(task_options.get("product_barcode", "")).strip()
+        if not product_barcode:
+            with STATE.lock:
+                product_barcode = str(STATE.current_barcode or "").strip()
+        if not product_barcode:
+            product_barcode = str(task_options.get("motor_barcode", "")).strip()
         return gui_safe_execute(
             run_traction_calibration,
-            task_options.get("motor_barcode", ""),
+            product_barcode,
             spinner_text="Running traction calibration",
         )
 
@@ -2305,6 +2056,15 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
     )
     STATE.set_product_context(context)
     node = context.steering_node_id
+    task_label = TASKS[task_id]
+    if task_id in STEERING_TASK_IDS_REQUIRING_START_CAN:
+        gui_safe_execute(
+            ensure_controller_ready_for_task,
+            context,
+            task_label,
+            allow_standard_node=task_id in {"run_all", "load_script_config", "load_script"},
+            spinner_text=f"Connecting CAN for {task_label}",
+        )
     reportable_tasks = {"load_script_config", "start_calibration", "start_zeroing"}
     report = (
         prepare_report_for_context(context)
@@ -2329,11 +2089,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
 
     if task_id == "load_script_config":
         try:
-            gui_safe_execute(
-                ensure_controller_ready_for_configuration,
-                context,
-                spinner_text="Checking controller before Configuration",
-            )
             gui_safe_execute(
                 refresh_report_controller_serial,
                 report,
@@ -2378,12 +2133,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
         print(
             "[INFO] Starting calibration without post-calibration zero write. "
             "Use Write Zero before Calibration when the physical zero must be saved."
-        )
-        gui_safe_execute(
-            ensure_controller_ready_for_task,
-            context,
-            "Calibration",
-            spinner_text="Checking controller before Calibration",
         )
         gui_safe_execute(
             refresh_report_controller_serial,
@@ -2438,12 +2187,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
     if task_id == "test_calibration":
         TestCalibration = load_test_calibration_module()
 
-        gui_safe_execute(
-            ensure_controller_ready_for_task,
-            context,
-            "TestCalibration",
-            spinner_text="Checking controller before TestCalibration",
-        )
         result = gui_safe_execute(
             TestCalibration.main,
             serial_last4=SERIAL_LAST4,
@@ -2483,12 +2226,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
         )
 
     if task_id == "start_zeroing":
-        gui_safe_execute(
-            ensure_controller_ready_for_task,
-            context,
-            "Write Zero",
-            spinner_text="Checking controller before Write Zero",
-        )
         gui_safe_execute(
             refresh_report_controller_serial,
             report,
@@ -2916,16 +2653,17 @@ def run_all(tester_name: str | None = None) -> bool:
     post_calibration_zero_done = False
 
     try:
+        gui_safe_execute(
+            ensure_task_can_connected,
+            context,
+            "Run All",
+            allow_standard_node=True,
+            spinner_text="Connecting CAN for Run All",
+        )
         report = gui_safe_execute(
             prepare_report_for_context,
             context,
             spinner_text="Preparing result workbook",
-        )
-        gui_safe_execute(
-            ensure_controller_ready_for_task,
-            context,
-            "Run All",
-            spinner_text="Checking controller before Run All",
         )
 
         config_details = gui_safe_execute(
@@ -3127,18 +2865,24 @@ def _patch_eol_product_family_resolution() -> None:
                     os.chdir(old_cwd)
                 except Exception:
                     pass
-            if not product_dir_raw:
-                raise FileNotFoundError(f"[ERROR] No matching folder found for QR code: {text}")
             product_base = configured_product_base_path(
                 getattr(eol_find_product_folder, "config", None)
             )
             if product_base is None and hasattr(eol_find_product_folder, "get_products_root"):
                 product_base = eol_find_product_folder.get_products_root()
-            product_dir = resolve_product_family_dir(
-                text,
-                product_dir_raw,
-                product_base,
-            )
+            if not product_dir_raw:
+                product_dir = find_product_family_folder_from_roots(
+                    text,
+                    getattr(eol_find_product_folder, "config", None),
+                )
+                if product_dir is None:
+                    raise FileNotFoundError(f"[ERROR] No matching folder found for QR code: {text}")
+            else:
+                product_dir = resolve_product_family_dir(
+                    text,
+                    product_dir_raw,
+                    product_base,
+                )
 
         spec_path = original_find_product_spec_v2(product_dir)
         return product_dir, spec_path
@@ -3453,7 +3197,11 @@ def open_controller(
     MicontrolF35_CAN = driver_miControlF35.MicontrolF35_CAN
 
     can = DriverCan(can_bitrate=can_bitrate)
-    mic = MicontrolF35_CAN(can=can.can_network, node=node)
+    try:
+        mic = MicontrolF35_CAN(can=can.can_network, node=node)
+    except Exception:
+        can.close_can()
+        raise
     if not mic.added_node:
         can.close_can()
         raise RuntimeError(f"Could not add CAN node {node}.")
@@ -3605,14 +3353,26 @@ def run_load_config(
     from logic.FlashConfigZero import MU_Handle, mu, write_just_conf
 
     can, mic, owned = acquire_controller(node, can_bitrate=can_bitrate)
+    aux_arduino = None
+    aux_previous_mask: int | None = None
 
     try:
+        aux_arduino, aux_previous_mask = activate_operation_auxiliary_relay("MU config load")
         handle = MU_Handle()
         ok = write_just_conf(mu, handle, mic, SERIAL_LAST4)
         if not ok:
             raise RuntimeError("MU config load failed.")
         return True
     finally:
+        if aux_arduino is not None and aux_previous_mask is not None:
+            try:
+                restore_relays_after_operation_auxiliary(
+                    aux_arduino,
+                    aux_previous_mask,
+                    "MU config load",
+                )
+            except Exception as exc:
+                print(f"[WARN] Could not restore relays after MU config load: {exc}")
         release_controller(can, owned)
 
 
@@ -4160,30 +3920,125 @@ def operation_relay_mask(motor_voltage: object | None = None) -> int:
     return controller_power_relay_mask()
 
 
+def task_start_relay_mask() -> int:
+    return controller_power_relay_mask()
+
+
+def activate_operation_relays_for_task(task_label: str):
+    relay_mask = task_start_relay_mask()
+    STATE.set_activity(step="Activating task relays...", state="running", mark_error=False)
+    print(f"[STATUS] Activating task relays for {task_label}: mask 0x{relay_mask:03X}.")
+    arduino = _get_or_connect_relay_arduino()
+    try:
+        _confirmed_set_relays(arduino, relay_mask, "task relays")
+    except Exception as exc:
+        try:
+            _confirmed_set_relays(arduino, 0, "task relays off after activation failure", stable_reads=1)
+        except Exception as cleanup_exc:
+            print(f"[WARN] Could not switch task relays off after activation failure: {cleanup_exc}")
+        raise RuntimeError(f"Could not activate task relays for {task_label}: {exc}") from exc
+    _wait_for_operation_relays_settle(task_label)
+    return arduino
+
+
+def _wait_for_operation_relays_settle(task_label: str) -> None:
+    settle_s = max(0.0, float(OPERATION_RELAY_SETTLE_S))
+    if settle_s <= 0.0:
+        return
+    STATE.set_activity(
+        step=f"Waiting {settle_s:.1f}s for task relays to settle...",
+        state="running",
+        mark_error=False,
+    )
+    print(
+        f"[STATUS] Waiting {settle_s:.1f}s for task relays to settle "
+        f"before {task_label}."
+    )
+    time.sleep(settle_s)
+
+
+def deactivate_operation_relays_for_task(task_label: str) -> None:
+    STATE.set_activity(step="Deactivating task relays...", state="running", mark_error=False)
+    print(f"[STATUS] Deactivating task relays after {task_label}.")
+    arduino = _get_or_connect_relay_arduino()
+    try:
+        _confirmed_set_relays(arduino, 0, "task relays off")
+    except Exception as exc:
+        raise RuntimeError(f"Could not deactivate task relays after {task_label}: {exc}") from exc
+
+
+def activate_operation_auxiliary_relay(label: str):
+    arduino = _get_or_connect_relay_arduino()
+    try:
+        previous_mask = int(arduino.get_relays())
+    except Exception:
+        previous_mask = task_start_relay_mask()
+    target_mask = controller_power_relay_mask()
+    print(
+        f"[STATUS] Ensuring controller power relay mask for {label}: "
+        f"mask 0x{target_mask:03X}."
+    )
+    _confirmed_set_relays(arduino, target_mask, "controller power relay mask")
+    _wait_for_operation_relays_settle(label)
+    return arduino, previous_mask
+
+
+def restore_relays_after_operation_auxiliary(arduino, previous_mask: int, label: str) -> None:
+    target_mask = controller_power_relay_mask()
+    print(f"[STATUS] Keeping controller power relay mask after {label}: mask 0x{target_mask:03X}.")
+    _confirmed_set_relays(arduino, target_mask, "controller power relay mask restore")
+
+
+def wait_for_manual_operation_relay_step(action: str, task_label: str) -> None:
+    action_text = "activate" if action == "activate" else "deactivate"
+    print(
+        f"[STATUS] Manual relay mode: {action_text} operation relays for "
+        f"{task_label}, then press Continue."
+    )
+    if not STATE.request_relay_confirmation(action_text, task_label, RELAY_CONFIRM_TIMEOUT_S):
+        raise RuntimeError(
+            f"Timed out waiting for manual relay {action_text} confirmation for {task_label}."
+        )
+    print(f"[INFO] Manual relay {action_text} confirmed for {task_label}.")
+
+
 def _confirmed_set_relays(arduino, mask: int, label: str, stable_reads: int = 3) -> None:
     target = int(mask) & 0x1FFF
-    if not arduino._set_relays_bits(target):
-        raise RuntimeError(f"Failed to set {label} relay mask 0x{target:03X}.")
-
+    set_errors: list[str] = []
     stable = 0
     last = None
-    for _ in range(10):
+    for attempt in range(3):
         try:
-            last = arduino.get_relays() & 0x1FFF
-            if last == target:
-                stable += 1
-                if stable >= stable_reads:
-                    print(f"[INFO] {label}: relay mask confirmed 0x{target:03X}.")
-                    return
-            else:
-                stable = 0
-        except Exception:
-            stable = 0
-        time.sleep(0.03)
+            if not arduino._set_relays_bits(target):
+                set_errors.append(f"attempt {attempt + 1}: no matching relay-set echo")
+        except Exception as exc:
+            set_errors.append(f"attempt {attempt + 1}: {exc}")
 
+        for _ in range(10):
+            try:
+                last = arduino.get_relays() & 0x1FFF
+                if last == target:
+                    stable += 1
+                    if stable >= stable_reads:
+                        if set_errors:
+                            print(
+                                f"[WARN] {label}: relay-set echo was incomplete, "
+                                f"but readback confirmed 0x{target:03X}."
+                            )
+                        else:
+                            print(f"[INFO] {label}: relay mask confirmed 0x{target:03X}.")
+                        return
+                else:
+                    stable = 0
+            except Exception:
+                stable = 0
+            time.sleep(0.03)
+
+    error_detail = f" Set errors: {'; '.join(set_errors)}." if set_errors else ""
     raise RuntimeError(
         f"Relay readback mismatch for {label}: expected 0x{target:03X}, "
         f"last={None if last is None else f'0x{last:03X}'}"
+        f"{error_detail}"
     )
 
 
@@ -4243,6 +4098,329 @@ def _controller_reconnect_after_relay_power_on(
     return connected, message
 
 
+def _command_detail(result: subprocess.CompletedProcess) -> str:
+    return (result.stderr or result.stdout or "").strip()
+
+
+def _privilege_failure_detail(detail: str) -> bool:
+    lower_detail = str(detail or "").lower()
+    return (
+        "operation not permitted" in lower_detail
+        or "permission denied" in lower_detail
+        or "authentication is required" in lower_detail
+        or "interactive authentication required" in lower_detail
+        or "access denied" in lower_detail
+    )
+
+
+def _sudo_password() -> str:
+    return os.getenv(ST_SUDO_PASSWORD_ENV, ST_DEFAULT_SUDO_PASSWORD)
+
+
+def _run_sudo_command(
+    command: list[str],
+    *,
+    timeout_s: float,
+) -> tuple[bool, str]:
+    sudo = shutil.which("sudo")
+    if not sudo:
+        return False, "sudo is not available."
+
+    timeout = max(0.1, float(timeout_s))
+    sudo_command = [sudo, "-n", *command]
+    sudo_result = subprocess.run(
+        sudo_command,
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    sudo_detail = _command_detail(sudo_result)
+    if sudo_result.returncode == 0:
+        return True, " ".join(sudo_command)
+
+    password = _sudo_password()
+    if not password:
+        return False, f"{' '.join(sudo_command)} failed: {sudo_detail or 'sudo password unavailable'}"
+
+    sudo_password_command = [sudo, "-S", "-p", "", *command]
+    sudo_password_result = subprocess.run(
+        sudo_password_command,
+        input=f"{password}\n",
+        text=True,
+        capture_output=True,
+        timeout=timeout,
+        check=False,
+    )
+    sudo_password_detail = _command_detail(sudo_password_result)
+    safe_command_text = " ".join([sudo, *command])
+    if sudo_password_result.returncode == 0:
+        return True, safe_command_text
+    return False, (
+        f"{safe_command_text} failed: "
+        f"{sudo_password_detail or sudo_detail or 'unknown error'}"
+    )
+
+
+def _run_ip_link_command(args: list[str], timeout_s: float = 5.0) -> tuple[bool, str]:
+    ip = shutil.which("ip") or "/usr/sbin/ip"
+    command = [ip, *args]
+    result = subprocess.run(
+        command,
+        text=True,
+        capture_output=True,
+        timeout=max(0.1, float(timeout_s)),
+        check=False,
+    )
+    detail = _command_detail(result)
+    if result.returncode == 0:
+        return True, " ".join(command)
+
+    if not _privilege_failure_detail(detail):
+        return False, f"{' '.join(command)} failed: {detail or 'unknown error'}"
+
+    sudo_ok, sudo_detail = _run_sudo_command(command, timeout_s=timeout_s)
+    if sudo_ok:
+        return True, sudo_detail
+    return False, f"{' '.join(command)} failed: {sudo_detail or detail or 'unknown error'}"
+
+
+def cycle_can0_link_down_up(
+    channel: str | None = None,
+    timeout_s: float = 5.0,
+) -> tuple[bool, str]:
+    can_channel = channel or os.getenv("ST_CAN_CHANNEL", "can0")
+    print(f"[STATUS] Cycling {can_channel} down/up after CAN reconnect failure.")
+    commands_run: list[str] = []
+    for args in (
+        ["link", "set", can_channel, "down"],
+        ["link", "set", can_channel, "up"],
+    ):
+        try:
+            ok, detail = _run_ip_link_command(args, timeout_s=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False, f"Cycling {can_channel} down/up timed out."
+        except Exception as exc:
+            return False, f"Could not cycle {can_channel} down/up: {exc}"
+        commands_run.append(detail)
+        if not ok:
+            return False, f"Could not cycle {can_channel} down/up: {detail}"
+    return True, f"Cycled {can_channel} down/up."
+
+
+NATIVE_SOCKETCAN_DRIVER_MARKERS = (
+    "gs_usb:",
+    "peak_usb:",
+    "kvaser_usb:",
+    "ems_usb:",
+    "esd_usb:",
+    "mcp251xfd:",
+    "mttcan:",
+)
+
+
+def _can_failure_indicates_down_link(message: str) -> bool:
+    lower_message = message.lower()
+    return (
+        "network is down" in lower_message
+        or "link is down" in lower_message
+        or re.search(r"run:\s*sudo\s+ip\s+link\s+set\s+\S+\s+up\b", lower_message) is not None
+    )
+
+
+def _can_failure_indicates_interface_problem(message: str) -> bool:
+    lower_message = message.lower()
+    return (
+        _can_failure_indicates_down_link(message)
+        or "can interface" in lower_message
+        or "socketcan interface" in lower_message
+        or "does not exist" in lower_message
+        or "bitrate is none" in lower_message
+        or "could not inspect" in lower_message
+    )
+
+
+def _can_interface_recovery_skipped_message() -> str:
+    return (
+        "CAN interface recovery skipped: the SocketCAN link is up, but the "
+        "controller node did not respond. Check controller power, node ID, "
+        "CAN bitrate, wiring, and termination."
+    )
+
+
+def _socketcan_channel_status(
+    channel: str | None = None,
+    timeout_s: float = 2.0,
+) -> tuple[bool, str]:
+    can_channel = channel or os.getenv("ST_CAN_CHANNEL", "can0")
+    ip = shutil.which("ip") or "/usr/sbin/ip"
+    try:
+        result = subprocess.run(
+            [ip, "-details", "link", "show", can_channel],
+            text=True,
+            capture_output=True,
+            timeout=max(0.1, float(timeout_s)),
+            check=False,
+        )
+    except Exception as exc:
+        return False, f"Could not inspect {can_channel}: {exc}"
+
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout).strip()
+        return False, f"Could not inspect {can_channel}: {detail or 'unknown error'}"
+    return True, result.stdout
+
+
+def _socketcan_channel_uses_native_driver(
+    channel: str | None = None,
+    timeout_s: float = 2.0,
+) -> tuple[bool, str]:
+    can_channel = channel or os.getenv("ST_CAN_CHANNEL", "can0")
+    ok, status = _socketcan_channel_status(can_channel, timeout_s=timeout_s)
+    if not ok:
+        return False, status
+
+    for marker in NATIVE_SOCKETCAN_DRIVER_MARKERS:
+        if marker in status:
+            driver_name = marker.rstrip(":")
+            return True, f"{can_channel} is managed by native SocketCAN driver {driver_name}."
+    return False, f"{can_channel} does not look like a native SocketCAN USB interface."
+
+
+def _socketcan_configured_bitrate_hz(
+    channel: str | None = None,
+    timeout_s: float = 2.0,
+) -> int | None:
+    ok, status = _socketcan_channel_status(channel, timeout_s=timeout_s)
+    if not ok:
+        return None
+    match = re.search(r"\bbitrate\s+(\d+)\b", status)
+    return int(match.group(1)) if match else None
+
+
+def configure_socketcan_link_up(
+    *,
+    channel: str | None = None,
+    can_bitrate: int | None = None,
+    timeout_s: float = 5.0,
+) -> tuple[bool, str]:
+    can_channel = channel or os.getenv("ST_CAN_CHANNEL", "can0")
+    print(f"[STATUS] Configuring {can_channel} directly after CAN reconnect failure.")
+    commands: list[list[str]] = []
+    bitrate_hz: int | None = None
+    if can_bitrate is not None:
+        bitrate_hz = int(float(can_bitrate)) * 1000
+        current_bitrate_hz = _socketcan_configured_bitrate_hz(can_channel)
+        if current_bitrate_hz != bitrate_hz:
+            commands.extend([
+                ["link", "set", can_channel, "down"],
+                ["link", "set", can_channel, "type", "can", "bitrate", str(bitrate_hz)],
+            ])
+    commands.append(["link", "set", can_channel, "up"])
+
+    for args in commands:
+        try:
+            ok, detail = _run_ip_link_command(args, timeout_s=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False, f"Configuring {can_channel} timed out."
+        except Exception as exc:
+            return False, f"Could not configure {can_channel}: {exc}"
+        if not ok:
+            command_hint_parts = [
+                "sudo ip " + " ".join(command_args)
+                for command_args in commands
+            ]
+            command_hint = " && ".join(command_hint_parts)
+            return False, (
+                f"Could not configure {can_channel}: {detail}. "
+                f"Run: {command_hint}"
+            )
+
+    if bitrate_hz is None:
+        return True, f"Configured {can_channel} up."
+    return True, f"Configured {can_channel} up at {bitrate_hz} bitrate."
+
+
+def recover_can_interface_after_failure(
+    *,
+    first_failure: str,
+    can_bitrate: int | None = None,
+    channel: str | None = None,
+) -> tuple[bool, str]:
+    if not _can_failure_indicates_interface_problem(first_failure):
+        return False, _can_interface_recovery_skipped_message()
+
+    native_driver, native_message = _socketcan_channel_uses_native_driver(channel)
+    if native_driver:
+        stop_ok, stop_message = stop_st_can0_service()
+        if not stop_ok:
+            return False, f"{native_message} {stop_message}"
+        config_ok, config_message = configure_socketcan_link_up(
+            channel=channel,
+            can_bitrate=can_bitrate,
+        )
+        return config_ok, f"{native_message} {stop_message} {config_message}"
+
+    restart_ok, restart_message = restart_st_can0_service()
+    if restart_ok:
+        return True, restart_message
+
+    if channel is None:
+        cycle_ok, cycle_message = cycle_can0_link_down_up()
+    else:
+        cycle_ok, cycle_message = cycle_can0_link_down_up(channel=channel)
+    if not cycle_ok:
+        return False, f"{restart_message} {cycle_message}"
+    return True, f"{restart_message} {cycle_message}"
+
+
+def stop_st_can0_service(
+    service_name: str = ST_CAN_SERVICE_NAME,
+    timeout_s: float = ST_CAN_SERVICE_RESTART_TIMEOUT_S,
+) -> tuple[bool, str]:
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return True, f"systemctl is not available; skipped stopping {service_name}."
+
+    print(f"[STATUS] Stopping {service_name} before native SocketCAN configuration.")
+    command = [systemctl, "stop", service_name]
+    try:
+        result = subprocess.run(
+            command,
+            text=True,
+            capture_output=True,
+            timeout=max(0.1, float(timeout_s)),
+            check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return False, f"Stopping {service_name} timed out."
+    except Exception as exc:
+        return False, f"Could not stop {service_name}: {exc}"
+
+    if result.returncode == 0:
+        return True, f"Stopped {service_name}."
+
+    detail = _command_detail(result)
+    lower_detail = detail.lower()
+    if (
+        "not loaded" in lower_detail
+        or "not found" in lower_detail
+        or "could not be found" in lower_detail
+    ):
+        return True, f"{service_name} is not loaded; no stop needed."
+    if _privilege_failure_detail(detail):
+        try:
+            sudo_ok, sudo_detail = _run_sudo_command(command, timeout_s=timeout_s)
+        except subprocess.TimeoutExpired:
+            return False, f"Stopping {service_name} timed out."
+        except Exception as exc:
+            return False, f"Could not stop {service_name}: {exc}"
+        if sudo_ok:
+            return True, f"Stopped {service_name}."
+        return False, f"Could not stop {service_name}: {sudo_detail or detail or 'unknown error'}"
+    return False, f"Could not stop {service_name}: {detail or 'unknown error'}"
+
+
 def restart_st_can0_service(
     service_name: str = ST_CAN_SERVICE_NAME,
     timeout_s: float = ST_CAN_SERVICE_RESTART_TIMEOUT_S,
@@ -4252,9 +4430,10 @@ def restart_st_can0_service(
         return False, "systemctl is not available; could not restart st-can0.service."
 
     print(f"[STATUS] Restarting {service_name} after CAN reconnect failure.")
+    command = [systemctl, "restart", service_name]
     try:
         result = subprocess.run(
-            [systemctl, "restart", service_name],
+            command,
             text=True,
             capture_output=True,
             timeout=max(0.1, float(timeout_s)),
@@ -4266,7 +4445,17 @@ def restart_st_can0_service(
         return False, f"Could not restart {service_name}: {exc}"
 
     if result.returncode != 0:
-        detail = (result.stderr or result.stdout).strip()
+        detail = _command_detail(result)
+        if _privilege_failure_detail(detail):
+            try:
+                sudo_ok, sudo_detail = _run_sudo_command(command, timeout_s=timeout_s)
+            except subprocess.TimeoutExpired:
+                return False, f"Restarting {service_name} timed out."
+            except Exception as exc:
+                return False, f"Could not restart {service_name}: {exc}"
+            if sudo_ok:
+                return True, f"Restarted {service_name}."
+            return False, f"Could not restart {service_name}: {sudo_detail or detail or 'unknown error'}"
         return False, f"Could not restart {service_name}: {detail or 'unknown error'}"
     return True, f"Restarted {service_name}."
 
@@ -4278,10 +4467,13 @@ def _retry_controller_reconnect_after_st_can0_restart(
     context: ProductContext | None,
     first_failure: str,
 ) -> tuple[bool, str]:
-    restart_ok, restart_message = restart_st_can0_service()
-    STATE.append_status(restart_message, is_error=not restart_ok, mark_error=False)
-    if not restart_ok:
-        return False, f"{first_failure} {restart_message}"
+    recovery_ok, recovery_message = recover_can_interface_after_failure(
+        first_failure=first_failure,
+        can_bitrate=can_bitrate,
+    )
+    STATE.append_status(recovery_message, is_error=not recovery_ok, mark_error=False)
+    if not recovery_ok:
+        return False, f"{first_failure} {recovery_message}"
 
     time.sleep(ST_CAN_SERVICE_RESTART_SETTLE_S)
     connected, retry_message = _controller_reconnect_after_relay_power_on(
@@ -4290,9 +4482,9 @@ def _retry_controller_reconnect_after_st_can0_restart(
         context=context,
     )
     if connected:
-        STATE.append_status(f"{restart_message} {retry_message}")
-        return True, f"{restart_message} {retry_message}"
-    return False, f"{first_failure} {restart_message} Retry failed: {retry_message}"
+        STATE.append_status(f"{recovery_message} {retry_message}")
+        return True, f"{recovery_message} {retry_message}"
+    return False, f"{first_failure} {recovery_message} Retry failed: {retry_message}"
 
 
 def _check_gui_can_with_st_can0_retry(
@@ -4317,10 +4509,13 @@ def _check_gui_can_with_st_can0_retry(
     if connected:
         return connected, result_node, result_bitrate, message, context
 
-    restart_ok, restart_message = restart_st_can0_service()
-    STATE.append_status(restart_message, is_error=not restart_ok, mark_error=False)
-    if not restart_ok:
-        return False, result_node, result_bitrate, f"{message} {restart_message}", context
+    recovery_ok, recovery_message = recover_can_interface_after_failure(
+        first_failure=message,
+        can_bitrate=bitrate,
+    )
+    STATE.append_status(recovery_message, is_error=not recovery_ok, mark_error=False)
+    if not recovery_ok:
+        return False, result_node, result_bitrate, f"{message} {recovery_message}", context
 
     time.sleep(ST_CAN_SERVICE_RESTART_SETTLE_S)
     if explicit_target:
@@ -4337,12 +4532,12 @@ def _check_gui_can_with_st_can0_retry(
             check_standard_then_product_can_connection()
         )
     if connected:
-        return True, result_node, result_bitrate, f"{restart_message} {retry_message}", retry_context
+        return True, result_node, result_bitrate, f"{recovery_message} {retry_message}", retry_context
     return (
         False,
         result_node,
         result_bitrate,
-        f"{message} {restart_message} Retry failed: {retry_message}",
+        f"{message} {recovery_message} Retry failed: {retry_message}",
         retry_context,
     )
 
@@ -4403,17 +4598,18 @@ def restart_controller_with_relays(
     reconnect: bool = True,
     fail_on_reconnect_error: bool = True,
     off_seconds: float = CONTROLLER_POWER_CYCLE_OFF_S,
+    on_mask: int | None = None,
 ) -> tuple[bool, str]:
     _detach_manual_can_for_power_change("Restarting controller with relay power cycle...")
     arduino = _get_or_connect_relay_arduino()
-    on_mask = controller_power_relay_mask()
+    target_on_mask = controller_power_relay_mask() if on_mask is None else (int(on_mask) & 0x1FFF)
 
     print("[STATUS] Controller relay restart: power OFF.")
     _confirmed_set_relays(arduino, 0, "controller restart power off")
     time.sleep(max(0.0, float(off_seconds)))
 
     print("[STATUS] Controller relay restart: power ON.")
-    _confirmed_set_relays(arduino, on_mask, "controller restart power on")
+    _confirmed_set_relays(arduino, target_on_mask, "controller restart power on")
     time.sleep(CONTROLLER_POWER_ON_SETTLE_S)
     if not reconnect:
         return True, "Controller relay restart complete. CAN reconnect deferred."
@@ -4449,6 +4645,7 @@ def restart_controller_with_relays_for_task(context: ProductContext, reason: str
         ok, result_message = restart_controller_with_relays(
             context=context,
             off_seconds=CONTROLLER_POWER_CYCLE_OFF_S,
+            on_mask=operation_relay_mask(),
         )
     except Exception as exc:
         result_message = f"Relay controller restart failed: {exc}"
@@ -4472,6 +4669,7 @@ def automatic_controller_relay_restart(_timeout_s: float) -> bool:
             can_bitrate=bitrate,
             context=context,
             off_seconds=CONTROLLER_POWER_CYCLE_OFF_S,
+            on_mask=operation_relay_mask(),
         )
     except Exception as exc:
         message = f"Automatic relay restart failed: {exc}"
@@ -4781,6 +4979,22 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             self._send_json({"ok": ok})
             return
 
+        if parsed.path == "/confirm-relay-step":
+            ok = STATE.confirm_relay_step()
+            self._send_json({"ok": ok})
+            return
+
+        if parsed.path == "/relay-mode":
+            query = parse_qs(parsed.query)
+            try:
+                relay_mode = parse_relay_mode(query.get("mode", [""])[0])
+                STATE.set_relay_mode(relay_mode)
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)})
+                return
+            self._send_json({"ok": True, "relay_mode": relay_mode})
+            return
+
         if parsed.path == "/scan-option":
             query = parse_qs(parsed.query)
             try:
@@ -4789,6 +5003,43 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
             except ValueError as exc:
                 self._send_json({"ok": False, "error": str(exc)})
                 return
+            self._send_json({"ok": True})
+            return
+
+        if parsed.path == "/rescan-product":
+            query = parse_qs(parsed.query)
+            try:
+                raw_scan_option = query.get("option", [""])[0]
+                if raw_scan_option:
+                    scan_option = parse_scan_option(raw_scan_option)
+                else:
+                    with STATE.lock:
+                        scan_option = STATE.scan_option
+                product_code = query.get("product_code", [""])[0].strip()
+                awaiting_input = scan_option != SCAN_OPTION_QR_CAMERA and not product_code
+                ok, error, can_to_close = STATE.prepare_product_rescan(
+                    scan_option,
+                    awaiting_input=awaiting_input,
+                )
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)})
+                return
+            if can_to_close is not None:
+                try:
+                    can_to_close.close_can()
+                except Exception:
+                    pass
+            if not ok:
+                self._send_json({"ok": False, "error": error})
+                return
+            if awaiting_input:
+                self._send_json({"ok": True, "requires_input": True})
+                return
+            threading.Thread(
+                target=run_product_scan_and_can_check,
+                args=(None if scan_option == SCAN_OPTION_QR_CAMERA else product_code,),
+                daemon=True,
+            ).start()
             self._send_json({"ok": True})
             return
 

@@ -146,6 +146,18 @@ class _FakeSettlingZeroReferenceController:
         return fz.CONTROLLER_SSI_READY_STATUS
 
 
+class _FakeConfigController:
+    def __init__(self) -> None:
+        self.digital_outputs: list[bool] = []
+        self.clear_error_calls = 0
+
+    def set_digital_output(self, enabled: bool) -> None:
+        self.digital_outputs.append(bool(enabled))
+
+    def clear_errors(self) -> None:
+        self.clear_error_calls += 1
+
+
 def _run_visual_zero_quietly(
     mic: _FakeVisualController,
     desired_angle: float,
@@ -194,6 +206,57 @@ class VisualZeroMathTests(unittest.TestCase):
                 (2, False, fz.ZERO_CONFIG_PATH, 0),
             ],
         )
+
+    def test_write_just_conf_uses_null_interface_fallback_for_default_adapter(self):
+        calls: list[tuple[str, object | None]] = []
+        original_set_interface = fz.mu.MU_SetInterface
+        original_open = fz.mu.MU_Open
+        original_close = fz.mu.MU_Close
+        original_use_revision = fz.mu.MU_UseRevision
+        original_initialize = fz.mu.MU_Initialize
+        original_load_params = fz.mu.MU_LoadParams
+        original_enter_biss = fz._enter_biss
+        original_write_params = fz.write_params_with_verify
+        original_write_ssi = fz.write_to_SSi
+        original_sleep = fz.time.sleep
+        try:
+            fz.mu.MU_Open = lambda _handle: calls.append(("open", None)) or fz.MU_OK
+            fz.mu.MU_Close = lambda _handle: calls.append(("close", None)) or fz.MU_OK
+            fz.mu.MU_UseRevision = lambda _handle, revision: calls.append(("revision", int(revision))) or fz.MU_OK
+            fz.mu.MU_Initialize = lambda _handle: calls.append(("initialize", None)) or fz.MU_OK
+            fz.mu.MU_LoadParams = lambda _handle, path: calls.append(("load", path)) or fz.MU_OK
+
+            def fake_set_interface(_handle, _interface, option):
+                calls.append(("interface", option))
+                return fz.MU_OK if option is None else 3
+
+            fz.mu.MU_SetInterface = fake_set_interface
+            fz._enter_biss = lambda _handle: calls.append(("biss", None)) or True
+            fz.write_params_with_verify = lambda _mu, _handle: calls.append(("write_params", None)) or fz.MU_OK
+            fz.write_to_SSi = lambda _mu, _handle: calls.append(("ssi", None)) or True
+            fz.time.sleep = lambda _seconds: None
+
+            mic = _FakeConfigController()
+            ok = fz.write_just_conf(fz.mu, fz.MU_Handle(), mic, "")
+        finally:
+            fz.mu.MU_SetInterface = original_set_interface
+            fz.mu.MU_Open = original_open
+            fz.mu.MU_Close = original_close
+            fz.mu.MU_UseRevision = original_use_revision
+            fz.mu.MU_Initialize = original_initialize
+            fz.mu.MU_LoadParams = original_load_params
+            fz._enter_biss = original_enter_biss
+            fz.write_params_with_verify = original_write_params
+            fz.write_to_SSi = original_write_ssi
+            fz.time.sleep = original_sleep
+
+        self.assertTrue(ok)
+        self.assertEqual(mic.digital_outputs, [True, False])
+        self.assertEqual(
+            [call for call in calls if call[0] == "interface"],
+            [("interface", b""), ("interface", None), ("interface", b""), ("interface", None)],
+        )
+        self.assertEqual(len([call for call in calls if call[0] == "load"]), 2)
 
     def test_visual_zero_error_is_literal_desired_minus_current(self):
         self.assertAlmostEqual(fz._visual_zero_error_deg(270.0, 18.39), 251.61)
