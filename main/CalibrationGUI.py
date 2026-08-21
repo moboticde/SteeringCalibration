@@ -77,6 +77,9 @@ ANGLE_READ_ATTEMPTS = 2
 SPIN_CHECK_DEG = 90.0
 SPIN_CHECK_RPM = 200
 SPIN_CHECK_TIMEOUT_S = 3.0
+CONFIGURATION_SPIN_CHECK_DEG = 10.0
+CONFIGURATION_SPIN_CHECK_RPM = 200
+CONFIGURATION_SPIN_CHECK_TIMEOUT_S = 2.0
 SPIN_FAILURE_ERROR = -1092
 MANUAL_SPIN_DEFAULT_RPM = 1000
 MANUAL_SPIN_STEP_RPM = 200
@@ -1738,7 +1741,11 @@ def set_status_bar_barcode(report: RunAllReport, node: int) -> None:
             STATE.can_connection_message = f"{report.qr_code}: CAN connected to node {node}."
 
 
-def prepare_report_for_context(context: ProductContext) -> RunAllReport:
+def prepare_report_for_context(
+    context: ProductContext,
+    *,
+    refresh_controller_serial: bool = True,
+) -> RunAllReport:
     node = context.steering_node_id
     desired_angle = context.zero_angle
     report = STATE.get_current_report()
@@ -1759,7 +1766,8 @@ def prepare_report_for_context(context: ProductContext) -> RunAllReport:
         )
 
     STATE.set_product_context(context)
-    refresh_report_controller_serial(report, node, context.can_bitrate)
+    if refresh_controller_serial:
+        refresh_report_controller_serial(report, node, context.can_bitrate)
     set_status_bar_barcode(report, node)
     print(f"[INFO] Result workbook: {report.path}")
     return report
@@ -2067,18 +2075,13 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
         )
     reportable_tasks = {"load_script_config", "start_calibration", "start_zeroing"}
     report = (
-        prepare_report_for_context(context)
+        prepare_report_for_context(
+            context,
+            refresh_controller_serial=task_id != "load_script_config",
+        )
         if task_id in reportable_tasks
         else STATE.get_current_report()
     )
-    if task_id in reportable_tasks:
-        gui_safe_execute(
-            refresh_report_controller_serial,
-            report,
-            node,
-            context.can_bitrate,
-            spinner_text="Reading controller serial",
-        )
 
     if task_id == "load_script":
         return gui_safe_execute(
@@ -2089,13 +2092,6 @@ def run_task(task_id: str, task_options: dict[str, object] | None = None):
 
     if task_id == "load_script_config":
         try:
-            gui_safe_execute(
-                refresh_report_controller_serial,
-                report,
-                node,
-                context.can_bitrate,
-                spinner_text="Reading controller serial",
-            )
             config_details = gui_safe_execute(
                 run_load_script_config_details,
                 context,
@@ -2663,6 +2659,7 @@ def run_all(tester_name: str | None = None) -> bool:
         report = gui_safe_execute(
             prepare_report_for_context,
             context,
+            refresh_controller_serial=False,
             spinner_text="Preparing result workbook",
         )
 
@@ -3318,16 +3315,33 @@ def load_steering_script_with_node_fallback(context: ProductContext) -> dict[str
 def run_load_script_config_details(context: ProductContext) -> dict[str, object]:
     script_info = load_steering_script_with_node_fallback(context)
     node = context.steering_node_id
+    if not restart_controller_with_relays_for_task(
+        context,
+        "Steering script loaded; applying product node ID.",
+    ):
+        return {
+            **script_info,
+            "ok": False,
+            "node": node,
+            "configuration_error_status": "Controller restart failed",
+        }
     print(f"[INFO] Steering script loaded. Loading MU config on product node {node}...")
-    if not run_load_config(node=node, can_bitrate=context.can_bitrate):
+    if not run_load_config(
+        node=node,
+        can_bitrate=context.can_bitrate,
+        manage_relays=False,
+    ):
         return {
             **script_info,
             "ok": False,
             "node": node,
             "configuration_error_status": "Configuration failed",
         }
-    print("[INFO] Script and MU config loaded. Checking that controller error -1092 is absent...")
-    check_ok, configuration_status = run_ssi_configuration_check_status(
+    print(
+        "[INFO] Script and MU config loaded. Clearing controller errors, "
+        "checking SSI, and running short spin validation..."
+    )
+    check_ok, configuration_status = run_configuration_controller_validation_status(
         node=node,
         can_bitrate=context.can_bitrate,
     )
@@ -3346,6 +3360,7 @@ def run_load_script_config(context: ProductContext) -> bool:
 def run_load_config(
     node: int = DEFAULT_NODE_ID,
     can_bitrate: int = DEFAULT_CAN_BITRATE,
+    manage_relays: bool = True,
 ) -> bool:
     from logic import FlashConfigZero
 
@@ -3357,7 +3372,8 @@ def run_load_config(
     aux_previous_mask: int | None = None
 
     try:
-        aux_arduino, aux_previous_mask = activate_operation_auxiliary_relay("MU config load")
+        if manage_relays:
+            aux_arduino, aux_previous_mask = activate_operation_auxiliary_relay("MU config load")
         handle = MU_Handle()
         ok = write_just_conf(mu, handle, mic, SERIAL_LAST4)
         if not ok:
@@ -3373,6 +3389,70 @@ def run_load_config(
                 )
             except Exception as exc:
                 print(f"[WARN] Could not restore relays after MU config load: {exc}")
+        release_controller(can, owned)
+
+
+def _configuration_status_for_error(error_value: object) -> str:
+    if error_value == -1092:
+        return "-1092"
+    return f"Error {error_value}"
+
+
+def run_configuration_controller_validation_status(
+    node: int = DEFAULT_NODE_ID,
+    can_bitrate: int = DEFAULT_CAN_BITRATE,
+) -> tuple[bool, str]:
+    can, mic, owned = acquire_controller(node, enable=False, can_bitrate=can_bitrate)
+    try:
+        print(f"[STATUS] Clearing MiControl errors on product node {node}.")
+        mic.clear_errors()
+        mic.clear_errors()
+
+        print("[STATUS] Checking that SSI encoder is enabled and error -1092 is absent.")
+        check_ok = bool(mic.get_extended_ssi())
+        error_value = getattr(mic, "last_ssi_configuration_error", None)
+        if not check_ok:
+            status = _configuration_status_for_error(error_value)
+            print(f"[RESULT] configuration_validation ok=False error={status}")
+            return False, status
+
+        ssi_status = mic.get_ssi_encoder_status()
+        print(f"[INFO] Controller SSI encoder status after configuration: {ssi_status}")
+        if ssi_status != SSI_READY_STATUS:
+            error_value = mic.get_error_code()
+            if error_value not in (None, 0):
+                status = _configuration_status_for_error(error_value)
+            else:
+                status = f"SSI status {ssi_status}"
+            print(f"[RESULT] configuration_validation ok=False error={status}")
+            return False, status
+
+        spin_ok = spin_to_angle_and_verify(
+            mic,
+            angle_deg=CONFIGURATION_SPIN_CHECK_DEG,
+            rpm=CONFIGURATION_SPIN_CHECK_RPM,
+            timeout_s=CONFIGURATION_SPIN_CHECK_TIMEOUT_S,
+        )
+        error_value = mic.get_error_code()
+        if error_value == -1092:
+            print("[RESULT] configuration_validation ok=False error=-1092")
+            return False, "-1092"
+        if error_value not in (None, 0):
+            status = _configuration_status_for_error(error_value)
+            print(f"[RESULT] configuration_validation ok=False error={status}")
+            return False, status
+        if not spin_ok:
+            print("[RESULT] configuration_validation ok=False error=Spin failed")
+            return False, "Spin failed"
+
+        print("[RESULT] configuration_validation ok=True error=0")
+        return True, "No error"
+    finally:
+        try:
+            mic.enabled(False)
+            STATE.set_controller_enabled(node, False)
+        except Exception:
+            pass
         release_controller(can, owned)
 
 

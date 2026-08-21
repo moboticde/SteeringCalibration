@@ -179,28 +179,96 @@ class CanInterfaceMessageTests(unittest.TestCase):
         )
         calls: list[tuple[object, ...]] = []
         original_load_script = gui.load_steering_script_with_node_fallback
+        original_restart = gui.restart_controller_with_relays_for_task
         original_load_config = gui.run_load_config
-        original_check = gui.run_ssi_configuration_check_status
+        original_validate = gui.run_configuration_controller_validation_status
         try:
             gui.load_steering_script_with_node_fallback = lambda _context: calls.append(("script", _context)) or {"script_path": "SteeringScript.py"}
-            gui.run_load_config = lambda *, node, can_bitrate: calls.append(("write_just_conf", node, can_bitrate)) or True
-            gui.run_ssi_configuration_check_status = lambda *, node, can_bitrate: calls.append(("ssi_check", node, can_bitrate)) or (True, "No error")
+            gui.restart_controller_with_relays_for_task = lambda _context, reason: calls.append(("restart", _context, reason)) or True
+            gui.run_load_config = lambda *, node, can_bitrate, manage_relays=True: calls.append(("write_just_conf", node, can_bitrate, manage_relays)) or True
+            gui.run_configuration_controller_validation_status = lambda *, node, can_bitrate: calls.append(("validate", node, can_bitrate)) or (True, "No error")
 
             result = gui.run_load_script_config_details(context)
         finally:
             gui.load_steering_script_with_node_fallback = original_load_script
+            gui.restart_controller_with_relays_for_task = original_restart
             gui.run_load_config = original_load_config
-            gui.run_ssi_configuration_check_status = original_check
+            gui.run_configuration_controller_validation_status = original_validate
 
         self.assertTrue(result["ok"])
         self.assertEqual(
             calls,
             [
                 ("script", context),
-                ("write_just_conf", 50, 250),
-                ("ssi_check", 50, 250),
+                ("restart", context, "Steering script loaded; applying product node ID."),
+                ("write_just_conf", 50, 250, False),
+                ("validate", 50, 250),
             ],
         )
+
+    def test_configuration_validation_reports_minus_1092_after_short_spin(self):
+        class FakeMic:
+            last_ssi_configuration_error = 0
+
+            def __init__(self) -> None:
+                self.disabled = False
+
+            def clear_errors(self) -> None:
+                pass
+
+            def get_extended_ssi(self) -> bool:
+                return True
+
+            def get_ssi_encoder_status(self) -> int:
+                return gui.SSI_READY_STATUS
+
+            def get_error_code(self) -> int:
+                return -1092
+
+            def enabled(self, status: bool) -> None:
+                self.disabled = not status
+
+        can = object()
+        mic = FakeMic()
+        calls: list[tuple[object, ...]] = []
+        original_acquire = gui.acquire_controller
+        original_release = gui.release_controller
+        original_spin = gui.spin_to_angle_and_verify
+        try:
+            gui.acquire_controller = (
+                lambda node, enable, can_bitrate: calls.append(("acquire", node, enable, can_bitrate)) or (can, mic, True)
+            )
+            gui.release_controller = lambda _can, owned: calls.append(("release", _can, owned))
+            gui.spin_to_angle_and_verify = (
+                lambda _mic, angle_deg, rpm, timeout_s: calls.append(("spin", _mic, angle_deg, rpm, timeout_s)) or True
+            )
+
+            ok, status = gui.run_configuration_controller_validation_status(
+                node=50,
+                can_bitrate=250,
+            )
+        finally:
+            gui.acquire_controller = original_acquire
+            gui.release_controller = original_release
+            gui.spin_to_angle_and_verify = original_spin
+
+        self.assertFalse(ok)
+        self.assertEqual(status, "-1092")
+        self.assertEqual(
+            calls,
+            [
+                ("acquire", 50, False, 250),
+                (
+                    "spin",
+                    mic,
+                    gui.CONFIGURATION_SPIN_CHECK_DEG,
+                    gui.CONFIGURATION_SPIN_CHECK_RPM,
+                    gui.CONFIGURATION_SPIN_CHECK_TIMEOUT_S,
+                ),
+                ("release", can, True),
+            ],
+        )
+        self.assertTrue(mic.disabled)
 
     def test_task_can_start_raises_after_failed_reconnect_and_recovery(self):
         context = gui.ProductContext(
