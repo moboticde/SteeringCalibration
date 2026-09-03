@@ -26,7 +26,7 @@ EOL_CASE_ROOT = Path("/home/mobotic/Internal Projects/EOL-case/02_EOL_files")
 EOL_CASE_MAIN_PATH = EOL_CASE_ROOT / "main" / "mobotic_EOL.py"
 TRACTION_CALIBRATION_ROOT = Path("/home/mobotic/Internal Projects/TrCalibration-Linux")
 TRACTION_CALIBRATION_WORKBOOK = MANUFACTURING_ROOT / "Calibration.xlsx"
-TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE = "auto"
+TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE = "mb5u"
 TRACTION_MHM_USB_ADAPTER_IDS = {
     "1ae4:3101": "MB5U",
     "1ae4:0003": "MB4U",
