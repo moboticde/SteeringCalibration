@@ -1,6 +1,6 @@
 arduino:
   VID: 0x2341
-  PID: 0x0042
+  PID: 0x003E
   BITRATE: 115200
 
 multimeter:
@@ -8,11 +8,12 @@ multimeter:
   PID: 0x09C4
 
 can:
-  VID: 0x0403
-  PID: 0xECD9
+  VID: 0x16D0
+  PID: 0x117E
+  BITRATE: 115200
 
 power_supply:
-  enabled: true
+  enabled: false
   model: owon_spe6053
   # Use "serial" for /dev/ttyUSBx or /dev/ttyACMx,
   # "usbtmc" for /dev/usbtmcX, or "visa" for VISA resources.

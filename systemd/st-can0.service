@@ -1,0 +1,17 @@
+[Unit]
+Description=Configure ST calibration SocketCAN interface
+Wants=systemd-udev-settle.service
+After=systemd-modules-load.service systemd-udev-settle.service
+
+[Service]
+Type=simple
+Restart=on-failure
+RestartSec=2
+ExecStartPre=/usr/sbin/modprobe slcan
+ExecStartPre=/bin/sh -c 'if /usr/sbin/ip link show can0 >/dev/null 2>&1; then /usr/sbin/ip link set can0 down; fi'
+ExecStart=/bin/sh -c 'exec "/home/mobotic/Internal Projects/StCalibration-Linux/.venv/bin/python" "/home/mobotic/Internal Projects/StCalibration-Linux/systemd/start_can0.py" --channel can0'
+ExecStartPost=/bin/sh -c 'for i in 1 2 3 4 5 6 7 8 9 10; do /usr/sbin/ip link show can0 >/dev/null 2>&1 && /usr/sbin/ip link set can0 up && exit 0; sleep 1; done; exit 1'
+ExecStopPost=/bin/sh -c 'if /usr/sbin/ip link show can0 >/dev/null 2>&1; then /usr/sbin/ip link set can0 down; fi'
+
+[Install]
+WantedBy=multi-user.target

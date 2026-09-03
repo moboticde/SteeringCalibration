@@ -1,22 +1,32 @@
 import serial
 import serial.tools.list_ports
-import pyvisa
 
 def find_serial_port(target_vid, target_pid):
     """
-    Finds and connects to a serial device by VID & PID.
+    Finds serial devices by VID & PID.
+
+    Returns a list of (device, description, hwid) tuples. Some drivers sort and
+    probe candidates because boards can expose multiple serial endpoints.
     
     """
     ports = serial.tools.list_ports.comports()
+    matches = []
 
     for port in ports:
         if port.vid == target_vid and port.pid == target_pid:
-            return port.device
+            matches.append((port.device, port.description, port.hwid))
+    return matches
 
 def find_visa_port(target_vid, target_pid):
     """
     Finds and connects to a VISA device by VID & PID.
     """
+    try:
+        import pyvisa
+    except ImportError:
+        print("[ERROR] pyvisa is required for VISA device discovery.")
+        return None
+
     rm = pyvisa.ResourceManager()
     resources = rm.list_resources()
 

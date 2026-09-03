@@ -1,0 +1,2587 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Steering Calibration</title>
+  <style>
+    :root {
+      --black: #000000;
+      --blue: #1ba9e1;
+      --white: #ffffff;
+      --muted: #9a9a9a;
+      --error: #ff6b6b;
+      --danger: #d71920;
+      --ok: #49d17d;
+      --panel: rgba(0, 0, 0, 0.9);
+      --shadow: 0 18px 55px rgba(0, 0, 0, 0.46);
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--white);
+      background: var(--black);
+      font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+    }
+
+    main {
+      width: min(940px, calc(100vw - 16px));
+      margin: 0 auto;
+      padding: 18px 18px 20px;
+      border-radius: 18px;
+      border: 2px solid var(--blue);
+      background: var(--panel);
+      box-shadow: var(--shadow);
+    }
+
+    .topbar {
+      display: grid;
+      grid-template-columns: 255px minmax(0, 1fr);
+      align-items: center;
+      gap: 14px;
+      margin-bottom: 6px;
+    }
+
+    .logo {
+      width: 280px;
+      height: auto;
+      flex: 0 0 auto;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: clamp(34px, 4.3vw, 42px);
+      color: var(--muted);
+      text-align: right;
+    }
+
+    #status {
+      margin: 6px 0 0;
+      color: var(--muted);
+      font-size: 19px;
+      font-weight: 800;
+      text-align: right;
+    }
+
+    #status.ok {
+      color: var(--ok);
+    }
+
+    #status.fail {
+      color: var(--error);
+    }
+
+    .scan-option {
+      display: grid;
+      grid-template-columns: max-content 1fr;
+      align-items: center;
+      justify-content: end;
+      gap: 8px;
+      margin-top: 10px;
+      color: var(--muted);
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .scan-option select {
+      min-height: 34px;
+      padding: 5px 10px;
+      border: 2px solid var(--blue);
+      border-radius: 10px;
+      color: var(--muted);
+      background: var(--black);
+      font: 13px "DejaVu Sans", "Liberation Sans", sans-serif;
+      font-weight: 800;
+      outline: none;
+    }
+
+    .relay-panel {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 8px;
+      min-width: 330px;
+      padding: 8px;
+      border: 2px solid rgba(27, 169, 225, 0.55);
+    }
+
+    .relay-status-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .relay-mode-row {
+      display: grid;
+      grid-template-columns: 1fr minmax(128px, 150px);
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .relay-mode-row select {
+      min-height: 32px;
+      padding: 5px 8px;
+      border: 2px solid var(--blue);
+      border-radius: 6px;
+      color: var(--muted);
+      background: var(--black);
+      font: 12px "DejaVu Sans", "Liberation Sans", sans-serif;
+      font-weight: 800;
+      outline: none;
+    }
+
+    #relay-status-badge {
+      min-width: 48px;
+      padding: 4px 8px;
+      color: var(--white);
+      background: var(--danger);
+      text-align: center;
+    }
+
+    #relay-status-badge.ok {
+      color: var(--black);
+      background: var(--ok);
+    }
+
+    .relay-footer {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 8px;
+      align-items: stretch;
+    }
+
+    .relay-footer button {
+      min-height: 32px;
+      padding: 5px 8px;
+      border-radius: 4px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .relay-footer .relay-end {
+      border-color: var(--danger);
+      color: var(--white);
+      background: #220000;
+    }
+
+    .relay-footer .relay-end:hover {
+      background: var(--danger);
+      box-shadow: 0 18px 32px rgba(215, 25, 32, 0.34);
+    }
+
+    button {
+      border: 2px solid var(--blue);
+      border-radius: 14px;
+      color: var(--muted);
+      background: var(--black);
+      box-shadow: none;
+      cursor: pointer;
+      font-weight: 800;
+      transition: transform 150ms ease, opacity 150ms ease, box-shadow 150ms ease, background 150ms ease;
+    }
+
+    button:hover {
+      transform: translateY(-2px);
+      background: var(--blue);
+      box-shadow: 0 18px 32px rgba(27, 169, 225, 0.34);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.38;
+      transform: none;
+      box-shadow: none;
+    }
+
+    button:disabled:hover {
+      background: var(--black);
+      box-shadow: none;
+      transform: none;
+    }
+
+    .run-all {
+      width: 100%;
+      min-height: 72px;
+      margin-bottom: 12px;
+      font-size: 20px;
+      color: var(--blue);
+    }
+
+    .kill-all {
+      min-height: 36px;
+      padding: 7px 14px;
+      border-color: var(--danger);
+      color: var(--white);
+      background: #220000;
+      font-size: 13px;
+    }
+
+    .continue-power {
+      display: none;
+      width: 100%;
+      min-height: 54px;
+      margin: 0 0 12px;
+      border-color: var(--ok);
+      color: var(--black);
+      background: var(--ok);
+      font-size: 18px;
+    }
+
+    .continue-power.visible {
+      display: block;
+    }
+
+    .continue-power:hover {
+      background: var(--ok);
+      box-shadow: 0 18px 32px rgba(73, 209, 125, 0.34);
+    }
+
+    .kill-all:hover {
+      background: var(--danger);
+      box-shadow: 0 18px 32px rgba(215, 25, 32, 0.34);
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      gap: 12px;
+      margin-bottom: 16px;
+    }
+
+    .grid button {
+      min-height: 58px;
+      padding: 12px;
+      color: var(--muted);
+      font-size: 14px;
+    }
+
+    .workflow-tabs {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 6px;
+      margin: 8px 0 0;
+    }
+
+    .workflow-tab {
+      min-height: 24px;
+      padding: 3px 8px;
+      border-radius: 8px;
+      font-size: 12px;
+    }
+
+    .workflow-tab.active {
+      color: var(--black);
+      background: var(--blue);
+    }
+
+    .workflow-panel {
+      display: none;
+      margin-bottom: 16px;
+    }
+
+    .workflow-panel.active {
+      display: block;
+    }
+
+    .workflow-panel[data-workflow-panel="eol"] .grid {
+      grid-template-columns: 1fr;
+    }
+
+    .settings {
+      display: grid;
+      grid-template-columns: max-content max-content max-content;
+      align-items: center;
+      justify-content: center;
+      gap: 26px;
+      margin: 0 0 14px;
+      padding: 16px 18px;
+      border: 2px solid var(--blue);
+      border-radius: 14px;
+    }
+
+    .can-controls {
+      display: grid;
+      grid-template-columns: 74px 84px;
+      gap: 8px;
+      align-items: end;
+    }
+
+    .can-controls label {
+      display: grid;
+      gap: 4px;
+      color: var(--muted);
+      font-size: 11px;
+      font-weight: 800;
+    }
+
+    .can-controls input {
+      width: 100%;
+      min-height: 34px;
+      padding: 6px 8px;
+      border-radius: 10px;
+      font-size: 14px;
+    }
+
+    .can-controls button {
+      min-height: 36px;
+      padding: 6px 9px;
+      border-radius: 12px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    #connect-can {
+      grid-column: 1 / -1;
+    }
+
+    label {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      color: var(--muted);
+      font-size: 17px;
+      font-weight: 800;
+    }
+
+    input {
+      width: 108px;
+      min-height: 42px;
+      padding: 9px 12px;
+      border: 2px solid var(--blue);
+      border-radius: 12px;
+      color: var(--muted);
+      background: var(--black);
+      font: 16px "DejaVu Sans", "Liberation Sans", sans-serif;
+      outline: none;
+    }
+
+    input:focus {
+      box-shadow: 0 0 0 3px rgba(27, 169, 225, 0.28);
+    }
+
+    .manual-spin {
+      display: grid;
+      grid-template-columns: 42px 72px 42px;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .manual-spin button {
+      min-height: 38px;
+      padding: 5px;
+      color: var(--muted);
+      font-size: 16px;
+    }
+
+    .spin-arrow {
+      width: 42px;
+      min-width: 42px;
+      font-size: 22px;
+      line-height: 1;
+      touch-action: none;
+      user-select: none;
+    }
+
+    .rpm-control {
+      display: grid;
+      grid-template-rows: 30px 24px 30px;
+      gap: 4px;
+      align-items: stretch;
+    }
+
+    .rpm-control button {
+      min-height: 30px;
+      padding: 3px;
+      font-size: 18px;
+      line-height: 1;
+    }
+
+    #manual-rpm {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 24px;
+      border: 2px solid var(--blue);
+      border-radius: 10px;
+      color: var(--muted);
+      background: var(--black);
+      font-size: 11px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .view-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 8px;
+    }
+
+    .view-head strong {
+      font-size: 17px;
+      color: var(--muted);
+    }
+
+    .view-actions {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .view-actions button {
+      padding: 8px 14px;
+      border-radius: 12px;
+      background: var(--black);
+      box-shadow: none;
+      font-size: 13px;
+    }
+
+    .view-actions button.active {
+      color: var(--black);
+      background: var(--blue);
+    }
+
+    .view-actions .kill-all {
+      border-color: var(--danger);
+      background: #220000;
+    }
+
+    .view-actions .kill-all:hover {
+      background: var(--danger);
+      box-shadow: 0 18px 32px rgba(215, 25, 32, 0.34);
+    }
+
+    .view {
+      display: none;
+    }
+
+    .view.active {
+      display: block;
+    }
+
+    #status-feed {
+      height: min(42vh, 392px);
+      min-height: 340px;
+      margin: 0;
+      padding: 18px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border-radius: 14px;
+      border: 2px solid var(--blue);
+      color: var(--muted);
+      background: var(--black);
+      font: 15px/1.55 "DejaVu Sans Mono", "Liberation Mono", monospace;
+    }
+
+    #status-feed.fail {
+      color: var(--error);
+    }
+
+    #log {
+      height: min(44vh, 430px);
+      min-height: 220px;
+      margin: 0;
+      padding: 18px;
+      overflow: auto;
+      white-space: pre-wrap;
+      border-radius: 14px;
+      border: 2px solid var(--blue);
+      color: var(--muted);
+      background: var(--black);
+      font: 14px/1.45 "DejaVu Sans Mono", "Liberation Mono", monospace;
+    }
+
+    @media (max-width: 760px) {
+      main {
+        margin: 16px auto;
+        padding: 18px;
+        border-radius: 18px;
+      }
+
+      .grid {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+
+      .workflow-tabs {
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+      }
+
+      .settings {
+        grid-template-columns: 1fr;
+        justify-content: center;
+        justify-items: center;
+        padding: 12px;
+      }
+
+
+      .manual-spin {
+        justify-content: start;
+      }
+
+      input {
+        width: 100%;
+      }
+
+      .topbar {
+        grid-template-columns: 1fr;
+        align-items: start;
+        gap: 16px;
+      }
+
+      h1 {
+        text-align: right;
+      }
+
+      #status {
+        text-align: right;
+      }
+
+      .scan-option {
+        justify-content: stretch;
+      }
+    }
+    .ux-shell {
+      display: grid;
+      grid-template-columns: 248px minmax(620px, 1fr) 330px;
+      gap: 8px;
+      width: min(1540px, calc(100vw - 16px));
+      min-height: calc(100vh - 16px);
+      margin: 8px auto;
+      padding: 0;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      box-shadow: none;
+    }
+
+    .ux-panel {
+      border: 1px solid #2c3944;
+      border-radius: 6px;
+      background: linear-gradient(145deg, rgba(21, 28, 35, 0.96), rgba(9, 13, 16, 0.98));
+      box-shadow: 0 18px 60px rgba(0, 0, 0, 0.45);
+    }
+
+    .ux-rail {
+      display: grid;
+      grid-template-rows: auto auto 1fr;
+      gap: 24px;
+      padding: 28px 14px 16px;
+    }
+
+    .ux-rail .logo {
+      width: 231px;
+      margin: 0 auto 6px;
+    }
+
+    .ux-title,
+    .ux-label {
+      margin: 0;
+      color: #aeb7c0;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .ux-rail .workflow-tabs {
+      grid-template-columns: 1fr;
+      gap: 10px;
+      margin: 0;
+    }
+
+    .ux-rail .workflow-tab {
+      display: grid;
+      grid-template-columns: 32px 1fr;
+      align-items: center;
+      gap: 10px;
+      min-height: 50px;
+      padding: 10px 14px;
+      border-radius: 6px;
+      text-align: left;
+      color: #ffffff;
+    }
+
+    .ux-rail .workflow-tab.active {
+      color: #ffffff;
+      background: linear-gradient(180deg, #18baf0 0%, #0b9dde 100%);
+      box-shadow: 0 12px 28px rgba(27, 169, 225, 0.28);
+    }
+
+    .ux-rail #eol-last-report {
+      display: grid;
+      grid-template-columns: 32px 1fr;
+      align-items: center;
+      gap: 10px;
+      min-height: 42px;
+      margin-top: -2px;
+      padding: 8px 14px;
+      border: 1px solid #2c3944;
+      border-radius: 6px;
+      color: #aeb7c0;
+      background: rgba(12, 17, 22, 0.74);
+      font-size: 12px;
+      text-align: left;
+    }
+
+    .ux-rail #eol-last-report[hidden] {
+      display: none;
+    }
+
+    .ux-rail #eol-last-report:hover {
+      color: #ffffff;
+      border-color: #1ba9e1;
+      background: rgba(27, 169, 225, 0.14);
+    }
+
+    .ux-report-text {
+      white-space: pre-line;
+      min-width: 0;
+    }
+
+    .ux-tab-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 28px;
+      height: 28px;
+      border: 1px solid currentColor;
+      border-radius: 50%;
+      font-size: 15px;
+      line-height: 1;
+    }
+
+    .ux-rail-section {
+      display: grid;
+      gap: 10px;
+    }
+
+    .ux-app {
+      display: grid;
+      grid-template-rows: auto 1fr;
+      gap: 8px;
+      min-width: 0;
+    }
+
+    .ux-main-panel {
+      padding: 20px 22px 0;
+    }
+
+    .ux-topbar {
+      display: grid;
+      grid-template-columns: 1fr 320px;
+      gap: 24px;
+      align-items: start;
+      padding-bottom: 18px;
+      border-bottom: 1px solid #2c3944;
+    }
+
+    .ux-product-strip {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      align-items: center;
+      min-width: 0;
+    }
+
+    .ux-metric {
+      display: grid;
+      gap: 6px;
+      min-width: 124px;
+      padding-right: 18px;
+      border-right: 1px solid #2c3944;
+    }
+
+    .ux-metric span {
+      color: #aeb7c0;
+      font-size: 12px;
+      text-transform: uppercase;
+    }
+
+    .ux-metric strong {
+      overflow: hidden;
+      color: #1ba9e1;
+      font-size: 17px;
+      white-space: nowrap;
+      text-overflow: ellipsis;
+    }
+
+    .ux-badge,
+    .ux-system-pill {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-height: 30px;
+      padding: 5px 13px;
+      border: 1px solid rgba(73, 209, 125, 0.38);
+      border-radius: 5px;
+      color: #49d17d;
+      background: rgba(73, 209, 125, 0.16);
+      font-size: 12px;
+      font-weight: 800;
+    }
+
+    .ux-badge.warn,
+    .ux-system-pill.warn {
+      border-color: rgba(245, 168, 0, 0.42);
+      color: #f5a800;
+      background: rgba(245, 168, 0, 0.12);
+    }
+
+    .ux-badge.fail,
+    .ux-system-pill.fail {
+      border-color: rgba(255, 92, 85, 0.5);
+      color: #ff5c55;
+      background: rgba(255, 92, 85, 0.12);
+    }
+
+    .ux-scan {
+      display: grid;
+      grid-template-columns: 1fr minmax(88px, auto) auto;
+      gap: 10px;
+      align-items: end;
+      margin: 0;
+    }
+
+    .ux-scan label {
+      display: grid;
+      gap: 7px;
+      color: #aeb7c0;
+      font-size: 12px;
+      font-weight: 800;
+      text-transform: uppercase;
+    }
+
+    .ux-scan select,
+    .ux-hardware input {
+      width: 100%;
+      min-height: 36px;
+      padding: 7px 10px;
+      border: 1px solid #3d4b56;
+      border-radius: 4px;
+      color: #ffffff;
+      background: rgba(6, 9, 12, 0.88);
+      font: 14px "DejaVu Sans", "Liberation Sans", sans-serif;
+    }
+
+    .ux-scan button {
+      min-height: 36px;
+      padding: 7px 12px;
+      border-radius: 4px;
+      font-size: 13px;
+    }
+
+    .ux-status-inline {
+      display: flex;
+      align-items: center;
+      gap: 7px;
+      min-height: 36px;
+      color: #49d17d;
+      font-size: 13px;
+      font-weight: 800;
+      white-space: nowrap;
+    }
+
+    .ux-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: currentColor;
+      box-shadow: 0 0 12px currentColor;
+    }
+
+    .ux-shell #status {
+      display: none;
+    }
+
+    .ux-pipeline-wrap {
+      padding: 22px 0 0;
+    }
+
+    .ux-pipeline {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(118px, 1fr));
+      gap: 20px;
+      padding: 16px 0 8px;
+    }
+
+    .ux-step-card {
+      position: relative;
+      display: grid;
+      grid-template-rows: auto auto minmax(54px, 1fr) auto auto;
+      justify-items: center;
+      min-height: 224px;
+      padding: 16px 12px;
+      border: 1px solid #3d4b56;
+      border-radius: 6px;
+      color: #ffffff;
+      background: radial-gradient(circle at 50% 0%, rgba(27, 169, 225, 0.08), transparent 38%), rgba(12, 17, 22, 0.84);
+    }
+
+    .ux-step-card.connects-next::after {
+      content: "";
+      position: absolute;
+      top: 50%;
+      right: -21px;
+      width: 20px;
+      height: 2px;
+      background: #1ba9e1;
+    }
+
+    .ux-step-card.auxiliary-step {
+      background: rgba(12, 17, 22, 0.62);
+    }
+
+    .ux-step-number {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 38px;
+      height: 38px;
+      border: 1px solid #1ba9e1;
+      border-radius: 50%;
+      color: #1ba9e1;
+      font-size: 18px;
+    }
+
+    .ux-step-card h2 {
+      margin: 12px 0 8px;
+      font-size: 16px;
+      font-weight: 700;
+      text-align: center;
+    }
+
+    .ux-step-card p {
+      min-height: 48px;
+      margin: 0;
+      color: #aeb7c0;
+      font-size: 14px;
+      line-height: 1.45;
+      text-align: center;
+    }
+
+    .ux-step-state {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+      width: 100%;
+      min-height: 36px;
+      margin-top: auto;
+      border: 1px solid #3d4b56;
+      border-radius: 5px;
+      color: #aeb7c0;
+      background: rgba(255, 255, 255, 0.03);
+      font-weight: 800;
+      font-size: 14px;
+    }
+
+    button.ux-step-state:hover {
+      transform: translateY(-1px);
+      background: rgba(27, 169, 225, 0.18);
+    }
+
+    button.ux-step-state:disabled {
+      opacity: 1;
+    }
+
+    .ux-step-time {
+      margin-top: 10px;
+      color: #78838d;
+      font-size: 13px;
+      min-height: 18px;
+    }
+
+    .ux-step-card.pass .ux-step-state {
+      border-color: #49d17d;
+      color: #ffffff;
+      background: linear-gradient(180deg, rgba(73, 209, 125, 0.3), rgba(21, 120, 59, 0.62));
+    }
+
+    .ux-step-card.running .ux-step-state,
+    .ux-step-card.pending .ux-step-state {
+      border-color: #f5a800;
+      color: #f5a800;
+      background: rgba(245, 168, 0, 0.12);
+    }
+
+    .ux-step-card.fail .ux-step-state {
+      border-color: #ff5c55;
+      color: #ff5c55;
+      background: rgba(255, 92, 85, 0.12);
+    }
+
+    .ux-center-actions {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 10px;
+      padding: 10px 0 16px;
+    }
+
+    .ux-center-actions .run-all {
+      display: grid;
+      grid-template-columns: 44px max-content;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      min-height: 64px;
+      margin: 0;
+      border-color: #1ba9e1;
+      color: #ffffff;
+      background: linear-gradient(180deg, #18baf0 0%, #0aa1de 100%);
+      font-size: 22px;
+    }
+
+    .ux-run-note {
+      margin-top: 0;
+      color: #aeb7c0;
+      font-size: 13px;
+      text-align: center;
+    }
+
+    .ux-ssi-option {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      min-height: 38px;
+      color: #aeb7c0;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .ux-ssi-option label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      color: #aeb7c0;
+      font-size: 13px;
+      font-weight: 800;
+    }
+
+    .ux-ssi-option input {
+      width: 18px;
+      min-height: 18px;
+      padding: 0;
+      border-radius: 4px;
+      accent-color: #1ba9e1;
+    }
+
+    .ux-ssi-option output {
+      min-width: 44px;
+      text-align: right;
+      color: #ffffff;
+    }
+
+    .ux-log-panel {
+      min-height: 250px;
+      padding: 0 14px 14px;
+      overflow: hidden;
+    }
+
+    .ux-log-panel .view-head {
+      min-height: 46px;
+      margin: 0;
+      border-bottom: 1px solid #2c3944;
+    }
+
+    .ux-log-panel #view-title {
+      display: none;
+    }
+
+    .ux-log-panel .view-actions {
+      justify-content: flex-start;
+      width: 100%;
+    }
+
+    .ux-log-panel .view-actions button {
+      min-height: 34px;
+      padding: 6px 13px;
+      border-color: transparent;
+      border-radius: 0;
+      background: transparent;
+      font-size: 13px;
+    }
+
+    .ux-log-panel .view-actions button.active {
+      color: #ffffff;
+      border-bottom: 2px solid #1ba9e1;
+      background: transparent;
+    }
+
+    .ux-log-panel .view-actions .log-tool {
+      margin-left: auto;
+      border: 1px solid #2c3944;
+      border-radius: 5px;
+    }
+
+    .ux-log-panel #status-feed,
+    .ux-log-panel #log {
+      height: 220px;
+      min-height: 0;
+      margin: 0;
+      padding: 16px 10px 6px;
+      border: 0;
+      border-radius: 0;
+      background: transparent;
+      font-size: 14px;
+    }
+
+    .ux-log-panel #status-feed {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      white-space: normal;
+      font-family: "DejaVu Sans", "Liberation Sans", sans-serif;
+      font-size: 15px;
+    }
+
+    .ux-activity-spinner {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 34px;
+      height: 34px;
+      border: 1px solid #1ba9e1;
+      border-radius: 50%;
+      color: #1ba9e1;
+      font: 20px/1 "DejaVu Sans Mono", "Liberation Mono", monospace;
+      flex: 0 0 auto;
+    }
+
+    .ux-activity-text {
+      display: grid;
+      gap: 6px;
+      min-width: 0;
+    }
+
+    .ux-activity-label {
+      color: #ffffff;
+      font-size: 16px;
+      font-weight: 800;
+    }
+
+    .ux-activity-step {
+      color: #aeb7c0;
+      font-size: 14px;
+      line-height: 1.45;
+    }
+
+    #status-feed.fail .ux-activity-spinner,
+    #status-feed.fail .ux-activity-step {
+      color: #ff5c55;
+      border-color: #ff5c55;
+    }
+
+    .ux-hardware {
+      display: grid;
+      grid-template-rows: auto auto auto auto 1fr;
+      gap: 10px;
+      padding: 20px 12px 10px;
+      min-width: 0;
+    }
+
+    .ux-hardware-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 6px 4px;
+    }
+
+    .ux-hardware-card {
+      display: grid;
+      gap: 14px;
+      padding: 14px 12px;
+      border: 1px solid #2c3944;
+      border-radius: 5px;
+      background: rgba(12, 17, 22, 0.74);
+    }
+
+    .ux-hardware .can-controls {
+      grid-template-columns: 1fr;
+      gap: 12px;
+    }
+
+    .ux-hardware .can-controls label {
+      display: grid;
+      grid-template-columns: 1fr 134px;
+      gap: 10px;
+      align-items: center;
+      color: #aeb7c0;
+      font-size: 14px;
+      font-weight: 500;
+    }
+
+    .ux-hardware #connect-can {
+      display: grid;
+      grid-template-columns: 28px max-content;
+      align-items: center;
+      justify-content: center;
+      gap: 7px;
+      width: 100%;
+    }
+
+    .ux-hardware .controller-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .ux-hardware .relay-status-row {
+      justify-content: space-between;
+    }
+
+    .ux-hardware #relay-status-badge {
+      border: 1px solid rgba(255, 92, 85, 0.45);
+      border-radius: 5px;
+      color: #ff5c55;
+      background: rgba(255, 92, 85, 0.12);
+    }
+
+    .ux-hardware #relay-status-badge.ok {
+      border-color: rgba(73, 209, 125, 0.45);
+      color: #49d17d;
+      background: rgba(73, 209, 125, 0.16);
+    }
+
+    .ux-hardware #relay-status-badge.warn {
+      border-color: rgba(245, 168, 0, 0.45);
+      color: #f5a800;
+      background: rgba(245, 168, 0, 0.12);
+    }
+
+    .ux-hardware .relay-footer {
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .ux-hardware .relay-footer button {
+      display: grid;
+      gap: 5px;
+      justify-items: center;
+      min-height: 66px;
+      padding: 8px 4px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+
+    .ux-hardware #relays-power-on {
+      border-color: #49d17d;
+      color: #ffffff;
+      background: rgba(73, 209, 125, 0.16);
+    }
+
+    .ux-hardware #relays-restart {
+      border-color: #1ba9e1;
+      color: #ffffff;
+      background: rgba(27, 169, 225, 0.12);
+    }
+
+    .ux-hardware #relays-check-termination {
+      border-color: #f5a800;
+      color: #ffffff;
+      background: rgba(245, 168, 0, 0.12);
+    }
+
+    .ux-hardware .relay-footer .relay-end {
+      border-color: #d71920;
+      color: #ffffff;
+      background: rgba(215, 25, 32, 0.18);
+    }
+
+    .ux-hardware .manual-spin {
+      grid-template-columns: 1fr;
+      justify-content: stretch;
+      gap: 14px;
+    }
+
+    .ux-hardware .manual-spin.hidden {
+      display: none;
+    }
+
+    .ux-rpm-row {
+      display: grid;
+      grid-template-columns: 1fr 164px 34px;
+      align-items: center;
+      gap: 8px;
+      color: #aeb7c0;
+      font-size: 13px;
+    }
+
+    .ux-hardware .rpm-control {
+      grid-template-rows: none;
+      grid-template-columns: 34px 1fr 34px;
+      gap: 0;
+      border: 1px solid #3d4b56;
+      border-radius: 4px;
+      overflow: hidden;
+      background: rgba(6, 9, 12, 0.88);
+    }
+
+    .ux-hardware .rpm-control button {
+      min-height: 34px;
+      border: 0;
+      border-radius: 0;
+      font-size: 18px;
+    }
+
+    .ux-hardware #manual-rpm {
+      min-height: 34px;
+      border: 0;
+      border-radius: 0;
+      color: #ffffff;
+      background: transparent;
+      font-size: 14px;
+    }
+
+    .ux-jog-actions {
+      display: grid;
+      grid-template-columns: 1fr 90px 1fr;
+      gap: 10px;
+    }
+
+    .ux-jog-actions button {
+      min-height: 44px;
+      width: auto;
+      min-width: 0;
+      border-radius: 6px;
+      font-size: 13px;
+    }
+
+    .ux-kill {
+      width: 100%;
+      min-height: 112px;
+      border-color: #d71920;
+      color: #ffffff;
+      background:
+        repeating-linear-gradient(135deg, rgba(255, 92, 85, 0.22) 0 8px, transparent 8px 16px) top / 100% 12px no-repeat,
+        repeating-linear-gradient(135deg, rgba(255, 92, 85, 0.22) 0 8px, transparent 8px 16px) bottom / 100% 12px no-repeat,
+        linear-gradient(180deg, rgba(126, 21, 20, 0.78), rgba(74, 9, 8, 0.9));
+      font-size: 26px;
+    }
+
+    .ux-kill small {
+      display: block;
+      margin-top: 8px;
+      color: #ffaaa6;
+      font-size: 13px;
+    }
+
+    @media (max-width: 1180px) {
+      .ux-shell {
+        grid-template-columns: 248px minmax(0, 1fr);
+      }
+
+      .ux-hardware {
+        grid-column: 1 / -1;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        align-items: start;
+      }
+
+      .ux-hardware-head,
+      .ux-kill {
+        grid-column: 1 / -1;
+      }
+    }
+
+    @media (max-width: 900px) {
+      .ux-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .ux-topbar,
+      .ux-center-actions {
+        grid-template-columns: 1fr;
+      }
+
+      .ux-pipeline {
+        grid-template-columns: 1fr;
+        gap: 12px;
+      }
+
+      .ux-step-card {
+        min-height: 210px;
+      }
+
+      .ux-step-card::after {
+        display: none;
+      }
+    }
+  </style>
+</head>
+<body>
+  <main class="ux-shell">
+    <aside class="ux-panel ux-rail">
+      <img class="logo" src="/logo.png" alt="MOBOTIC logo">
+
+      <section class="ux-rail-section">
+        <h2 class="ux-title">Workflow</h2>
+        <div class="workflow-tabs" role="tablist" aria-label="Workflow tabs">
+          <button class="workflow-tab active" data-workflow-tab="steering" type="button"><span class="ux-tab-icon">S</span>Steering</button>
+          <button class="workflow-tab" data-workflow-tab="traction" type="button"><span class="ux-tab-icon">T</span>Traction</button>
+          <button class="workflow-tab" data-workflow-tab="eol" type="button"><span class="ux-tab-icon">E</span>EOL</button>
+        </div>
+        <button id="eol-last-report" class="ux-report-link" type="button" hidden><span class="ux-tab-icon">R</span>See last report</button>
+      </section>
+
+    </aside>
+
+    <section class="ux-app">
+      <div class="ux-panel ux-main-panel">
+        <div class="ux-topbar">
+          <div class="ux-product-strip">
+            <div class="ux-metric">
+              <span>Product</span>
+              <strong id="product-code">-</strong>
+            </div>
+            <span id="product-badge" class="ux-badge warn">No product</span>
+          </div>
+          <div class="ux-scan">
+            <label for="scan-option">Scan option
+              <select id="scan-option">
+                <option value="qr_camera">QR Camera</option>
+                <option value="qr_scanner">QR Scanner</option>
+                <option value="barcode_scanner">Barcode Scanner</option>
+                <option value="manual">Manual</option>
+              </select>
+            </label>
+            <button id="rescan-product" type="button">Rescan</button>
+            <div id="scan-health" class="ux-status-inline"><span class="ux-dot"></span>Camera OK</div>
+          </div>
+        </div>
+
+        <div id="status">Switch On Power Supply</div>
+
+        <div class="ux-pipeline-wrap">
+          <h2 class="ux-title">Calibration Pipeline</h2>
+          <section class="workflow-panel active" data-workflow-panel="steering">
+            <div class="ux-pipeline">
+              <article class="ux-step-card required-step connects-next" data-step="load_script_config">
+                <span class="ux-step-number">1</span>
+                <h2>Configuration</h2>
+                <button class="ux-step-state" data-task="load_script_config" type="button">Run</button>
+                <span class="ux-step-time">-</span>
+              </article>
+              <article class="ux-step-card required-step connects-next" data-step="start_zeroing">
+                <span class="ux-step-number">2</span>
+                <h2>Write Zero</h2>
+                <button class="ux-step-state" data-task="start_zeroing" type="button">Run</button>
+                <span class="ux-step-time">-</span>
+              </article>
+              <article class="ux-step-card required-step" data-step="start_calibration">
+                <span class="ux-step-number">3</span>
+                <h2>Calibration</h2>
+                <button class="ux-step-state" data-task="start_calibration" type="button">Run</button>
+                <span class="ux-step-time">-</span>
+              </article>
+              <article class="ux-step-card auxiliary-step" data-step="test_calibration">
+                <h2>Test Calibration</h2>
+                <button class="ux-step-state" data-task="test_calibration" type="button">Run</button>
+                <span class="ux-step-time">-</span>
+              </article>
+              <article class="ux-step-card auxiliary-step" data-step="show_current_zero">
+                <h2>Show Current Zero</h2>
+                <button class="ux-step-state" data-task="show_current_zero" type="button">Run</button>
+                <span class="ux-step-time">-</span>
+              </article>
+            </div>
+            <button id="continue-power-cycle" class="continue-power" type="button">Continue after power cycle</button>
+            <div class="ux-center-actions">
+              <button class="run-all" data-task="run_all" type="button"><span>▶</span>Run all program</button>
+              <div class="ux-run-note">Executes all steps in sequence. Press Kill All to abort the current step.</div>
+            </div>
+          </section>
+
+          <section class="workflow-panel" data-workflow-panel="traction">
+            <div class="ux-center-actions">
+              <button class="run-all" data-task="traction_calibration" type="button"><span>▶</span>Traction Calibration</button>
+              <div></div>
+              <div class="ux-run-note">Runs the selected traction calibration program for the scanned product number.</div>
+            </div>
+          </section>
+
+          <section class="workflow-panel" data-workflow-panel="eol">
+            <div class="ux-center-actions">
+              <button class="run-all" data-task="run_eol" type="button"><span>▶</span>Run EOL</button>
+              <div></div>
+              <div class="ux-run-note">Runs end-of-line checks for the scanned product and motor.</div>
+            </div>
+          </section>
+        </div>
+      </div>
+
+      <div class="ux-panel ux-log-panel">
+        <div class="view-head">
+          <strong id="view-title">Status</strong>
+          <div class="view-actions">
+            <button id="status-tab" class="active" type="button">Status</button>
+            <button id="debug-tab" type="button">Debug</button>
+            <button id="clear-log" class="log-tool" type="button">Clear view</button>
+          </div>
+        </div>
+
+        <section id="status-view" class="view active">
+          <div id="status-feed" class="ux-activity">
+            <span id="activity-spinner" class="ux-activity-spinner">|</span>
+            <span class="ux-activity-text">
+              <strong id="activity-label" class="ux-activity-label">Ready</strong>
+              <span id="activity-step" class="ux-activity-step">Choose one operation.</span>
+            </span>
+          </div>
+        </section>
+
+        <section id="debug-view" class="view">
+          <pre id="log"></pre>
+        </section>
+      </div>
+    </section>
+
+    <aside class="ux-panel ux-hardware">
+      <div class="ux-hardware-head">
+        <h2 class="ux-title">Hardware</h2>
+        <span id="system-status" class="ux-system-pill warn"><span class="ux-dot"></span>Starting</span>
+      </div>
+
+      <section class="ux-hardware-card">
+        <h2 class="ux-title">CAN Settings</h2>
+        <div class="can-controls" aria-label="CAN controller controls">
+          <label for="can-node">Node ID
+            <input id="can-node" type="number" min="1" max="127" step="1" value="59" inputmode="numeric">
+          </label>
+          <label for="can-bitrate">Bitrate (kbit/s)
+            <input id="can-bitrate" type="number" min="1" max="1000" step="1" value="125" inputmode="numeric">
+          </label>
+          <button id="connect-can" type="button"><span>↔</span>Connect</button>
+          <div class="controller-actions">
+            <button id="drive-enable" type="button">Enable</button>
+            <button id="clear-errors" type="button">Clear error</button>
+          </div>
+          <div class="ux-ssi-option">
+            <label for="eol-ssi-encoder-restore">
+              <input id="eol-ssi-encoder-restore" type="checkbox" checked>
+              <span>SSI_encoder restore</span>
+            </label>
+            <output id="eol-ssi-encoder-value" for="eol-ssi-encoder-restore">True</output>
+          </div>
+        </div>
+      </section>
+
+      <section class="ux-hardware-card relay-panel" aria-label="Relay controls">
+        <div class="relay-status-row">
+          <h2 class="ux-title">Relay Power Status</h2>
+          <span id="relay-status-badge">Error</span>
+        </div>
+        <label class="relay-mode-row" for="relay-mode">
+          <span>Task Relay Mode</span>
+          <select id="relay-mode">
+            <option value="automatic">Automatic</option>
+            <option value="manual">Manual</option>
+          </select>
+        </label>
+        <div class="relay-footer">
+          <button id="relays-power-on" type="button" title="Activate STO A, STO B, BRAKE, 24V, Rele+, and Rele-"><span>⏻</span>Power On</button>
+          <button id="relays-restart" type="button" title="Power-cycle the controller relays and reconnect CAN"><span>↻</span>Restart</button>
+          <button id="relays-check-termination" type="button" title="Measure CAN termination resistance"><span>Ω</span>Check Termination</button>
+          <button id="relays-power-off" class="relay-end" type="button" title="Disable controller relays and disconnect CAN"><span>⏻</span>Power Off</button>
+        </div>
+      </section>
+
+      <section class="ux-hardware-card manual-spin" aria-label="Manual motor spin">
+        <h2 class="ux-title">Manual Jog</h2>
+        <div class="ux-rpm-row">
+          <span>Target RPM</span>
+          <div class="rpm-control">
+            <button id="rpm-minus" type="button" title="Decrease RPM">-</button>
+            <div id="manual-rpm">1000</div>
+            <button id="rpm-plus" type="button" title="Increase RPM">+</button>
+          </div>
+          <span>RPM</span>
+        </div>
+        <div class="ux-jog-actions">
+          <button id="spin-left" class="spin-arrow" type="button" title="Hold to spin left">← Reverse</button>
+          <button id="manual-stop" type="button">Stop</button>
+          <button id="spin-right" class="spin-arrow" type="button" title="Hold to spin right">Forward →</button>
+        </div>
+      </section>
+
+      <button id="kill-all" class="kill-all ux-kill" type="button">Kill All<small>Stop all programs immediately</small></button>
+    </aside>
+  </main>
+
+  <script>
+    const statusEl = document.querySelector("#status");
+    const statusFeedEl = document.querySelector("#status-feed");
+    const logEl = document.querySelector("#log");
+    const scanOptionEl = document.querySelector("#scan-option");
+    const rescanProductEl = document.querySelector("#rescan-product");
+    const canNodeInputEl = document.querySelector("#can-node");
+    const canBitrateInputEl = document.querySelector("#can-bitrate");
+    const connectCanEl = document.querySelector("#connect-can");
+    const driveEnableEl = document.querySelector("#drive-enable");
+    const clearErrorsEl = document.querySelector("#clear-errors");
+    const systemStatusEl = document.querySelector("#system-status");
+    const productCodeEl = document.querySelector("#product-code");
+    const productBadgeEl = document.querySelector("#product-badge");
+    const scanHealthEl = document.querySelector("#scan-health");
+    const killAllEl = document.querySelector("#kill-all");
+    const relaysPowerOnEl = document.querySelector("#relays-power-on");
+    const relaysRestartEl = document.querySelector("#relays-restart");
+    const relaysCheckTerminationEl = document.querySelector("#relays-check-termination");
+    const relaysPowerOffEl = document.querySelector("#relays-power-off");
+    const relayStatusBadgeEl = document.querySelector("#relay-status-badge");
+    const relayModeEl = document.querySelector("#relay-mode");
+    const continuePowerCycleEl = document.querySelector("#continue-power-cycle");
+    const spinLeftEl = document.querySelector("#spin-left");
+    const spinRightEl = document.querySelector("#spin-right");
+    const manualJogEl = document.querySelector(".manual-spin");
+    const rpmPlusEl = document.querySelector("#rpm-plus");
+    const rpmMinusEl = document.querySelector("#rpm-minus");
+    const manualRpmEl = document.querySelector("#manual-rpm");
+    const manualStopEl = document.querySelector("#manual-stop");
+    const eolLastReportEl = document.querySelector("#eol-last-report");
+    const eolSsiEncoderRestoreEl = document.querySelector("#eol-ssi-encoder-restore");
+    const eolSsiEncoderValueEl = document.querySelector("#eol-ssi-encoder-value");
+    const statusViewEl = document.querySelector("#status-view");
+    const debugViewEl = document.querySelector("#debug-view");
+    const statusTabEl = document.querySelector("#status-tab");
+    const debugTabEl = document.querySelector("#debug-tab");
+    const viewTitleEl = document.querySelector("#view-title");
+    const activitySpinnerEl = document.querySelector("#activity-spinner");
+    const activityLabelEl = document.querySelector("#activity-label");
+    const activityStepEl = document.querySelector("#activity-step");
+    const workflowTabEls = [...document.querySelectorAll("[data-workflow-tab]")];
+    const workflowPanelEls = [...document.querySelectorAll("[data-workflow-panel]")];
+    const pipelineStepEls = [...document.querySelectorAll("[data-step]")];
+    const buttons = [...document.querySelectorAll("[data-task]")];
+    const MANUAL_RPM_DEFAULT = 1000;
+    const MANUAL_RPM_STEP = 200;
+    const MANUAL_RPM_MIN = 200;
+    const MANUAL_RPM_MAX = 5000;
+    const TASKS_REQUIRING_TESTER_NAME = new Set(["run_all", "run_eol"]);
+    const EOL_REPORT_URL = "/eol-report";
+    const STEERING_TASKS = new Set([
+      "run_all",
+      "load_script_config",
+      "start_zeroing",
+      "start_calibration",
+      "test_calibration",
+      "show_current_zero"
+    ]);
+    let lastLength = 0;
+    let manualRpm = MANUAL_RPM_DEFAULT;
+    let heldSpinDirection = 0;
+    let manualCommandSeq = 0;
+    let canConnected = false;
+    let canCheckRunning = true;
+    let controllerEnabled = false;
+    let productScanCompleted = false;
+    let steeringAvailable = null;
+    let steeringVisible = false;
+    let tractionAvailable = true;
+    let tractionStatusMessage = "Scan product number first.";
+    let eolAvailable = false;
+    let eolStatusMessage = "Scan product first.";
+    let eolReportUrl = "";
+    let eolReportName = "";
+    let scannedProductCode = "";
+    let currentScanOption = "qr_camera";
+    let awaitingRelayConfirmation = false;
+    let activeWorkflowTab = "";
+    let awaitingProductScanPrompt = false;
+    let spinnerFrame = 0;
+    const SPINNER_FRAMES = ["|", "/", "-", "\\"];
+
+    function updateEolSsiEncoderValue() {
+      eolSsiEncoderValueEl.textContent = eolSsiEncoderRestoreEl.checked ? "True" : "False";
+      localStorage.setItem("eolSsiEncoderRestore", eolSsiEncoderRestoreEl.checked ? "1" : "0");
+    }
+
+
+
+    function setBusy(isBusy) {
+      updateCanControls(isBusy);
+    }
+
+    function updateCanControls(isBusy = false) {
+      driveEnableEl.textContent = controllerEnabled ? "Disable" : "Enable";
+      connectCanEl.disabled = isBusy;
+      driveEnableEl.disabled = isBusy || !canConnected;
+      clearErrorsEl.disabled = isBusy || !canConnected;
+      relayModeEl.disabled = isBusy;
+    }
+
+    function setMainStatus(text, state) {
+      statusEl.textContent = text;
+      statusEl.classList.toggle("ok", state === "ok");
+      statusEl.classList.toggle("fail", state === "fail");
+    }
+
+    function setCanStatus(text, state) {
+      setMainStatus(text, state);
+    }
+
+    function updateManualRpm(delta) {
+      manualRpm = Math.max(MANUAL_RPM_MIN, Math.min(MANUAL_RPM_MAX, manualRpm + delta));
+      manualRpmEl.textContent = `${manualRpm}`;
+    }
+
+    function productFamilyFromCode(code) {
+      const text = String(code || "").trim();
+      const parts = text.split("-");
+      if (parts.length >= 3 && parts[0] && parts[1] && parts[2]) {
+        return `${parts[0]}-${parts[1]}-${parts[2]}`;
+      }
+      if (parts.length >= 2 && parts[0] && parts[1]) {
+        return `${parts[0]}-${parts[1]}`;
+      }
+      return text || "-";
+    }
+
+    function unitPrefixFromCode(code) {
+      const match = String(code || "").trim().match(/^([A-Za-z]+)/);
+      return match ? match[1].toUpperCase() : "";
+    }
+
+    function setBadge(el, text, tone = "") {
+      el.textContent = text;
+      el.classList.toggle("warn", tone === "warn");
+      el.classList.toggle("fail", tone === "fail");
+    }
+
+    function setActivityMessage(label, step = "", fail = false) {
+      activitySpinnerEl.textContent = fail ? "!" : "-";
+      activityLabelEl.textContent = label || "Ready";
+      activityStepEl.textContent = step || (fail ? "Open Debug for details." : "Choose one operation.");
+      statusFeedEl.classList.toggle("fail", fail);
+    }
+
+    function updateProductSummary(data) {
+      const qrCode = data.product_qr_code || "";
+      scannedProductCode = qrCode;
+      productCodeEl.textContent = qrCode ? productFamilyFromCode(qrCode) : "-";
+      if (data.product_scan_running === true) {
+        setBadge(productBadgeEl, "Scanning", "warn");
+      } else if (data.product_scan_error) {
+        setBadge(productBadgeEl, "Product error", "fail");
+      } else if (data.product_scan_completed === true) {
+        setBadge(productBadgeEl, data.steering_available === false ? "No steering" : "Product OK", "");
+      } else {
+        setBadge(productBadgeEl, "No product", "warn");
+      }
+
+      const option = data.scan_option || scanOptionEl.value;
+      currentScanOption = option;
+      const scanLabel = option === "qr_camera"
+        ? (data.product_scan_error ? "Camera issue" : "Camera OK")
+        : "Input ready";
+      scanHealthEl.lastChild.textContent = scanLabel;
+      scanHealthEl.style.color = data.product_scan_error ? "var(--error)" : "var(--ok)";
+    }
+
+    function updateSystemStatus(data) {
+      const failing = data.has_error === true || data.relay_connection_ok === false;
+      const waiting = (
+        data.running === true
+        || data.can_check_running === true
+        || data.relay_connecting === true
+        || data.awaiting_relay_confirmation === true
+      );
+      if (failing) {
+        setBadge(systemStatusEl, "System Error", "fail");
+      } else if (waiting) {
+        setBadge(systemStatusEl, "System Busy", "warn");
+      } else if (data.relay_connection_ok === true && data.can_connection_ok === true) {
+        setBadge(systemStatusEl, "System OK", "");
+      } else {
+        setBadge(systemStatusEl, "System Idle", "warn");
+      }
+    }
+
+    function updateActivity(data) {
+      const activity = data.activity || {};
+      const running = activity.state === "running" || data.running === true || data.awaiting_power_cycle === true;
+      const failed = activity.state === "fail" || data.has_error === true;
+      if (running) {
+        spinnerFrame = (spinnerFrame + 1) % SPINNER_FRAMES.length;
+      }
+      activitySpinnerEl.textContent = running
+        ? SPINNER_FRAMES[spinnerFrame]
+        : (failed ? "!" : "-");
+      activityLabelEl.textContent = activity.label || data.status || "Ready";
+      activityStepEl.textContent = activity.step || (failed ? "Open Debug for details." : "Choose one operation.");
+      statusFeedEl.classList.toggle("fail", failed);
+    }
+
+    function parseStatusTime(line) {
+      const match = String(line || "").match(/^(\d{2}:\d{2}:\d{2})\s+/);
+      return match ? match[1] : "-";
+    }
+
+    function lineResultState(line) {
+      const text = String(line || "").trim();
+      const lower = text.toLowerCase();
+      if (/\bok\s*=\s*true\b/i.test(text)) {
+        return "pass";
+      }
+      if (/\bok\s*=\s*false\b/i.test(text)) {
+        return "fail";
+      }
+      if (/\bnot\s+ok\b/i.test(text)) {
+        return "fail";
+      }
+      if (/\bok\b/i.test(text) && !/\bnot\s+ok\b/i.test(text)) {
+        return "pass";
+      }
+      const errorMatch = lower.match(/\berror\s*=\s*([^\s,;]+)/);
+      if (errorMatch) {
+        return ["0", "0.", "0.0", "none", "false", "no"].includes(errorMatch[1])
+          ? "pass"
+          : "fail";
+      }
+      if (/\bfailed\b|\bfail\b/i.test(text)) {
+        return "fail";
+      }
+      if (/\bfinished\b|\bpassed\b|\bcompleted\b|\bcomplete\b/i.test(text)) {
+        return "pass";
+      }
+      return "";
+    }
+
+    function updatePipeline(data) {
+      const lines = `${data.status_feed || ""}\n${data.log || ""}`.split("\n");
+      const statusText = `${data.status || ""}\n${data.status_feed || ""}\n${data.log || ""}`.toLowerCase();
+      const workbookStatus = data.conf_workflow_status || {};
+      const stepActionLabels = {
+        load_script_config: "Run",
+        start_zeroing: "Run",
+        start_calibration: "Run",
+        test_calibration: "Run",
+        show_current_zero: "Run"
+      };
+      const stepMeta = {
+        load_script_config: {
+          include: ["configuration", "load product configuration"],
+          exclude: []
+        },
+        start_zeroing: {
+          include: ["write zero", "zeroing"],
+          exclude: ["current zero", "show current zero"]
+        },
+        start_calibration: {
+          include: ["started: calibration", "finished: calibration", "full calibration", "steering calibration"],
+          exclude: ["testcalibration", "test calibration"]
+        },
+        test_calibration: {
+          include: ["testcalibration", "test calibration"],
+          exclude: []
+        },
+        show_current_zero: {
+          include: ["show current zero", "current zero"],
+          exclude: []
+        }
+      };
+      pipelineStepEls.forEach((stepEl) => {
+        const step = stepEl.dataset.step;
+        const meta = stepMeta[step] || { include: [step], exclude: [] };
+        const stateEl = stepEl.querySelector(".ux-step-state");
+        const timeEl = stepEl.querySelector(".ux-step-time");
+        const workbookStep = workbookStatus[step] || {};
+        const matchedLines = lines.filter((line) => {
+          const lower = line.toLowerCase();
+          return meta.include.some((term) => lower.includes(term))
+            && !meta.exclude.some((term) => lower.includes(term));
+        });
+        const latestLine = matchedLines[matchedLines.length - 1] || "";
+        const explicitStates = matchedLines
+          .map(lineResultState)
+          .filter(Boolean);
+        const latestExplicitState = explicitStates[explicitStates.length - 1] || "";
+        const workbookState = workbookStep.state || "";
+        let state = workbookState && workbookState !== "idle" ? workbookState : "idle";
+        let label = state === "pass" ? "Done" : (state === "fail" ? "Retry" : (stepActionLabels[step] || "Run"));
+        let statusTime = workbookStep.time || parseStatusTime(latestLine);
+        if (
+          data.running === true
+          && meta.include.some((term) => statusText.includes(term))
+          && !meta.exclude.some((term) => statusText.includes(term))
+        ) {
+          state = "running";
+          label = "Running";
+          statusTime = parseStatusTime(latestLine);
+        } else if (latestExplicitState === "fail") {
+          state = "fail";
+          label = "Retry";
+        } else if (latestExplicitState === "pass") {
+          state = "pass";
+          label = "Done";
+        } else if (data.running === true && state === "idle") {
+          state = "pending";
+          label = "Queued";
+        }
+        stepEl.classList.toggle("pass", state === "pass");
+        stepEl.classList.toggle("running", state === "running");
+        stepEl.classList.toggle("pending", state === "pending");
+        stepEl.classList.toggle("fail", state === "fail");
+        stateEl.textContent = label;
+        timeEl.textContent = statusTime || "-";
+      });
+    }
+
+    function setView(viewName) {
+      const debug = viewName === "debug";
+      statusViewEl.classList.toggle("active", !debug);
+      debugViewEl.classList.toggle("active", debug);
+      statusTabEl.classList.toggle("active", !debug);
+      debugTabEl.classList.toggle("active", debug);
+      viewTitleEl.textContent = debug ? "Debug" : "Status";
+    }
+
+    function firstVisibleWorkflowTab() {
+      if (steeringVisible) {
+        return "steering";
+      }
+      if (tractionAvailable) {
+        return "traction";
+      }
+      if (eolAvailable) {
+        return "eol";
+      }
+      return "";
+    }
+
+    function setWorkflowTab(tabName) {
+      let targetTab = tabName;
+      if (targetTab === "steering" && !steeringVisible) {
+        targetTab = firstVisibleWorkflowTab();
+      }
+      const tabEl = workflowTabEls.find((el) => el.dataset.workflowTab === targetTab);
+      if (tabEl && (tabEl.disabled || tabEl.hidden)) {
+        return;
+      }
+      if (!targetTab) {
+        stopHeldSpin();
+      } else if (activeWorkflowTab === "steering" && targetTab !== "steering") {
+        stopHeldSpin();
+      }
+      activeWorkflowTab = targetTab;
+      workflowTabEls.forEach((tabEl) => {
+        tabEl.classList.toggle("active", targetTab && tabEl.dataset.workflowTab === targetTab);
+      });
+      workflowPanelEls.forEach((panelEl) => {
+        panelEl.classList.toggle("active", targetTab && panelEl.dataset.workflowPanel === targetTab);
+      });
+      manualJogEl.classList.toggle("hidden", targetTab !== "steering");
+    }
+
+    function updateWorkflowAvailability(data) {
+      productScanCompleted = data.product_scan_completed === true || Boolean(data.product_qr_code);
+      steeringAvailable = data.steering_available;
+      steeringVisible = productScanCompleted && steeringAvailable === true;
+      tractionAvailable = data.traction_available === true;
+      tractionStatusMessage = data.traction_status_message || "Scan product number first.";
+      eolAvailable = data.eol_available === true;
+      eolStatusMessage = data.eol_status_message || "EOL is not available.";
+      eolReportUrl = data.eol_report_url || (data.eol_done === true ? EOL_REPORT_URL : "");
+      eolReportName = data.eol_report_name || "";
+      const hasEolReport = eolReportUrl && eolReportName;
+      eolLastReportEl.hidden = !hasEolReport;
+      eolLastReportEl.title = hasEolReport ? eolReportName : "";
+      const reportIcon = document.createElement("span");
+      reportIcon.className = "ux-tab-icon";
+      reportIcon.textContent = "R";
+      const reportText = document.createElement("span");
+      reportText.className = "ux-report-text";
+      reportText.textContent = hasEolReport ? `See last report\n${eolReportName}` : "See last report";
+      eolLastReportEl.replaceChildren(reportIcon, reportText);
+      const steeringDisabled = !steeringVisible;
+      const tractionDisabled = !tractionAvailable;
+      const eolDisabled = !eolAvailable;
+      workflowTabEls.forEach((tabEl) => {
+        if (tabEl.dataset.workflowTab === "steering") {
+          tabEl.hidden = !steeringVisible;
+          tabEl.disabled = steeringDisabled;
+          tabEl.title = steeringDisabled
+            ? (productScanCompleted ? "This product has no steering workflow." : "Scan a product first.")
+            : "";
+        } else if (tabEl.dataset.workflowTab === "traction") {
+          tabEl.disabled = tractionDisabled;
+          tabEl.title = tractionDisabled ? tractionStatusMessage : "";
+        } else if (tabEl.dataset.workflowTab === "eol") {
+          tabEl.disabled = eolDisabled;
+          tabEl.title = eolStatusMessage;
+        }
+      });
+      workflowPanelEls.forEach((panelEl) => {
+        if (panelEl.dataset.workflowPanel === "steering") {
+          panelEl.hidden = !steeringVisible;
+        }
+      });
+
+      buttons.forEach((button) => {
+        if (STEERING_TASKS.has(button.dataset.task)) {
+          button.disabled = steeringDisabled || data.running === true;
+        } else if (button.dataset.task === "traction_calibration") {
+          button.disabled = tractionDisabled || data.running === true;
+          button.title = tractionDisabled ? tractionStatusMessage : "";
+        } else if (button.dataset.task === "run_eol") {
+          button.disabled = eolDisabled || data.running === true;
+          button.title = eolStatusMessage;
+        }
+      });
+      const activeTabEl = workflowTabEls.find((tabEl) => (
+        tabEl.dataset.workflowTab === activeWorkflowTab
+      ));
+      if (!activeTabEl || activeTabEl.disabled || activeTabEl.hidden) {
+        setWorkflowTab(firstVisibleWorkflowTab());
+      }
+    }
+
+    function scanOptionLabel(option) {
+      if (option === "qr_scanner") {
+        return "Scan product QR code";
+      }
+      if (option === "barcode_scanner") {
+        return "Scan product barcode";
+      }
+      if (option === "manual") {
+        return "Enter product code";
+      }
+      return "Scan product code";
+    }
+
+    function promptProductScanText(option) {
+      const previous = localStorage.getItem("lastProductScan") || "";
+      const scanned = window.prompt(scanOptionLabel(option), previous);
+      if (scanned === null) {
+        return null;
+      }
+      const trimmed = scanned.trim();
+      if (!trimmed) {
+        setActivityMessage("Product code is required", "Scan or enter a product code.", true);
+        setView("status");
+        return null;
+      }
+      localStorage.setItem("lastProductScan", trimmed);
+      return trimmed;
+    }
+
+    async function submitProductScan(scanText) {
+      const params = new URLSearchParams({ product_code: scanText });
+      try {
+        const response = await fetch(`/scan-product?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Product scan failed", data.error || "Open Debug for details.", true);
+          setView("status");
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      await refreshStatus();
+    }
+
+    function maybePromptProductScan(data) {
+      if (
+        data.awaiting_product_scan !== true
+        || data.product_scan_completed === true
+        || data.product_scan_running === true
+        || awaitingProductScanPrompt
+      ) {
+        return;
+      }
+      const option = data.scan_option || scanOptionEl.value;
+      if (option === "qr_camera") {
+        return;
+      }
+      awaitingProductScanPrompt = true;
+      window.setTimeout(async () => {
+        const scanned = promptProductScanText(option);
+        awaitingProductScanPrompt = false;
+        if (scanned !== null) {
+          await submitProductScan(scanned);
+        }
+      }, 50);
+    }
+
+    async function rescanProduct() {
+      const option = scanOptionEl.value;
+      const params = new URLSearchParams({ option });
+      if (option !== "qr_camera") {
+        const scanned = promptProductScanText(option);
+        if (scanned === null) {
+          return;
+        }
+        params.set("product_code", scanned);
+      }
+      setActivityMessage(
+        "Product rescan",
+        option === "qr_camera" ? "Starting QR camera scan." : "Loading product specification.",
+        false
+      );
+      setView("status");
+      rescanProductEl.disabled = true;
+      try {
+        const response = await fetch(`/rescan-product?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Product rescan failed", data.error || "Open Debug for details.", true);
+          setView("status");
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      await refreshStatus();
+    }
+
+    async function startTask(task) {
+      if (STEERING_TASKS.has(task) && !steeringVisible) {
+        const message = productScanCompleted
+          ? "This product specification has no steering information."
+          : "Scan a steering product before starting steering tasks.";
+        setActivityMessage("Steering disabled", message, false);
+        setWorkflowTab(firstVisibleWorkflowTab());
+        setView("status");
+        return;
+      }
+      if (task === "traction_calibration" && !tractionAvailable) {
+        setActivityMessage("Traction disabled", tractionStatusMessage, false);
+        setView("status");
+        return;
+      }
+      if (task === "run_eol" && !eolAvailable) {
+        setActivityMessage("EOL disabled", eolStatusMessage, true);
+        setView("status");
+        return;
+      }
+      const params = new URLSearchParams({ task });
+      if (TASKS_REQUIRING_TESTER_NAME.has(task)) {
+        const previousTesterName = localStorage.getItem("eolTesterName") || "";
+        const testerName = window.prompt("Tester name for EOL", previousTesterName);
+        if (testerName === null) {
+          return;
+        }
+        const trimmedTesterName = testerName.trim();
+        if (!trimmedTesterName) {
+          setActivityMessage("Tester name required", "Enter tester name for EOL.", true);
+          setView("status");
+          return;
+        }
+        localStorage.setItem("eolTesterName", trimmedTesterName);
+        params.set("tester_name", trimmedTesterName);
+      }
+      if (task === "run_eol") {
+        params.set("ssi_encoder_restore", eolSsiEncoderRestoreEl.checked ? "1" : "0");
+        let trimmedProductBarcode = "";
+        if (currentScanOption === "qr_camera" && scannedProductCode) {
+          trimmedProductBarcode = scannedProductCode;
+        } else {
+          const previousProductBarcode = localStorage.getItem("eolProductBarcode") || scannedProductCode || "";
+          const productBarcode = window.prompt("Scan product barcode for EOL", previousProductBarcode);
+          if (productBarcode === null) {
+            return;
+          }
+          trimmedProductBarcode = productBarcode.trim();
+        }
+        if (!trimmedProductBarcode) {
+          setActivityMessage("Product barcode required", "Scan product barcode for EOL.", true);
+          setView("status");
+          return;
+        }
+        localStorage.setItem("eolProductBarcode", trimmedProductBarcode);
+        params.set("product_barcode", trimmedProductBarcode);
+
+        let trimmedMotorBarcode = "0";
+        if (unitPrefixFromCode(trimmedProductBarcode) !== "SO") {
+          const previousMotorBarcode = localStorage.getItem("eolMotorBarcode") || "";
+          const motorBarcode = window.prompt("Scan motor barcode for EOL", previousMotorBarcode);
+          if (motorBarcode === null) {
+            return;
+          }
+          trimmedMotorBarcode = motorBarcode.trim();
+        }
+        if (!trimmedMotorBarcode) {
+          setActivityMessage("Motor barcode required", "Scan motor barcode for EOL.", true);
+          setView("status");
+          return;
+        }
+        localStorage.setItem("eolMotorBarcode", trimmedMotorBarcode);
+        params.set("motor_barcode", trimmedMotorBarcode);
+      }
+      if (task === "traction_calibration") {
+        const previousProductBarcode = localStorage.getItem("tractionProductBarcode") || scannedProductCode || "";
+        const productBarcode = window.prompt("Scan product number for Traction calibration", previousProductBarcode);
+        if (productBarcode === null) {
+          return;
+        }
+        const trimmedProductBarcode = productBarcode.trim();
+        if (!trimmedProductBarcode) {
+          setActivityMessage("Product number required", "Scan product number for Traction calibration.", true);
+          setView("status");
+          return;
+        }
+        localStorage.setItem("tractionProductBarcode", trimmedProductBarcode);
+        params.set("product_barcode", trimmedProductBarcode);
+      }
+      try {
+        const response = await fetch(`/start?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Could not start task", data.error || "Open Debug for details.", true);
+          setView("status");
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      await refreshStatus();
+    }
+
+    function manualSpin(rpm, seq = ++manualCommandSeq) {
+      if (!canConnected && rpm !== 0) {
+        setActivityMessage("CAN node is not connected", "Wait for CAN check or run a product task first.", true);
+        setView("status");
+        return Promise.resolve();
+      }
+      const params = new URLSearchParams({ rpm: String(rpm), seq: String(seq) });
+      return fetch(`/manual-spin?${params.toString()}`, { method: "POST" })
+        .then((response) => response.json())
+        .then((data) => {
+          if (!data.ok) {
+            setActivityMessage("Could not command motor", data.error || "Open Debug for details.", true);
+            setView("status");
+          }
+          return refreshStatus();
+        })
+        .catch((error) => {
+          setActivityMessage("Server connection problem", String(error), true);
+          setView("status");
+        });
+    }
+
+    function startHeldSpin(direction, event) {
+      event.preventDefault();
+      event.currentTarget.setPointerCapture?.(event.pointerId);
+      if (heldSpinDirection !== 0) {
+        return;
+      }
+      heldSpinDirection = direction;
+      manualSpin(direction * manualRpm);
+    }
+
+    function stopHeldSpin() {
+      if (heldSpinDirection === 0) {
+        return;
+      }
+      heldSpinDirection = 0;
+      manualSpin(0);
+    }
+
+    function sendReleaseBeacon() {
+      if (heldSpinDirection === 0) {
+        return;
+      }
+      heldSpinDirection = 0;
+      const params = new URLSearchParams({ rpm: "0", seq: String(++manualCommandSeq) });
+      if (navigator.sendBeacon) {
+        navigator.sendBeacon(`/manual-spin?${params.toString()}`);
+      } else {
+        fetch(`/manual-spin?${params.toString()}`, { method: "POST", keepalive: true });
+      }
+    }
+
+    async function refreshStatus() {
+      try {
+        const response = await fetch("/status");
+        const data = await response.json();
+        canConnected = data.can_connection_ok === true;
+        canCheckRunning = data.can_check_running === true;
+        awaitingRelayConfirmation = data.awaiting_relay_confirmation === true;
+        controllerEnabled = data.controller_enabled === true;
+        if (data.product_scan_completed === true || data.product_scan_running === true) {
+          awaitingProductScanPrompt = false;
+        }
+        rescanProductEl.disabled = (
+          data.running === true
+          || data.product_scan_running === true
+          || data.can_check_running === true
+        );
+        if (document.activeElement !== scanOptionEl && data.scan_option) {
+          scanOptionEl.value = data.scan_option;
+        }
+        if (document.activeElement !== canNodeInputEl && data.can_connection_node !== null && data.can_connection_node !== undefined) {
+          canNodeInputEl.value = String(data.can_connection_node);
+        }
+        if (document.activeElement !== canBitrateInputEl && data.can_connection_bitrate !== null && data.can_connection_bitrate !== undefined) {
+          canBitrateInputEl.value = String(data.can_connection_bitrate);
+        }
+        if (document.activeElement !== relayModeEl && data.relay_mode) {
+          relayModeEl.value = data.relay_mode;
+        }
+        let connectionText = "";
+        let connectionState = "";
+        if (canCheckRunning) {
+          connectionText = "Checking CAN connection...";
+          connectionState = "";
+        } else if (data.can_connection_ok === true) {
+          connectionText = data.can_connection_message || "CAN connected.";
+          connectionState = "ok";
+        } else {
+          const disconnected = (
+            (data.can_connection_message || "").startsWith("CAN disconnected")
+            || (data.can_connection_message || "") === "CAN not connected."
+          );
+          connectionText = data.can_connection_message || "CAN connection failed.";
+          connectionState = disconnected ? "" : "fail";
+        }
+        if (data.running === true || data.awaiting_power_cycle === true || awaitingRelayConfirmation) {
+          setMainStatus(data.status || "Running.", "");
+        } else if (data.has_error === true && data.status && !["Choose one operation", "Ready."].includes(data.status)) {
+          setMainStatus(data.status, "fail");
+        } else if (canCheckRunning || data.can_connection_ok === true) {
+          setMainStatus(connectionText, connectionState);
+        } else {
+          const idleStatus = data.status || "Choose one operation";
+          setMainStatus(
+            ["Ready.", "Choose one operation"].includes(idleStatus)
+              ? "Switch On Power Supply"
+              : idleStatus,
+            ""
+          );
+        }
+        setBusy(data.running);
+        updateRelayConnectionStatus(data);
+        updateWorkflowAvailability(data);
+        updateProductSummary(data);
+        updateSystemStatus(data);
+        updatePipeline(data);
+        updateActivity(data);
+        maybePromptProductScan(data);
+        if (data.awaiting_power_cycle === true) {
+          continuePowerCycleEl.textContent = "Continue after power cycle";
+        } else if (awaitingRelayConfirmation) {
+          const action = data.relay_confirmation_action || "relay step";
+          continuePowerCycleEl.textContent = `Continue after relay ${action}`;
+        }
+        continuePowerCycleEl.classList.toggle(
+          "visible",
+          data.awaiting_power_cycle === true || awaitingRelayConfirmation
+        );
+
+        if (data.log.length !== lastLength) {
+          logEl.textContent = data.log;
+          logEl.scrollTop = logEl.scrollHeight;
+          lastLength = data.log.length;
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", "Open Debug after the server is reachable again.", true);
+      }
+    }
+
+    function selectedCanTargetParams() {
+      const node = Number(canNodeInputEl.value);
+      const bitrate = Number(canBitrateInputEl.value);
+      if (!Number.isInteger(node) || node < 1 || node > 127) {
+        throw new Error("Node ID must be between 1 and 127.");
+      }
+      if (!Number.isInteger(bitrate) || bitrate < 1 || bitrate > 1000) {
+        throw new Error("CAN bitrate must be between 1 and 1000 kbit/s.");
+      }
+      return new URLSearchParams({ node: String(node), bitrate: String(bitrate) });
+    }
+
+    async function checkCanConnection(useSelectedTarget = false) {
+      let params = new URLSearchParams();
+      if (useSelectedTarget) {
+        try {
+          params = selectedCanTargetParams();
+        } catch (error) {
+          setActivityMessage("Invalid CAN settings", error.message, true);
+          setView("status");
+          return;
+        }
+      }
+      canConnected = false;
+      canCheckRunning = true;
+      setCanStatus("Checking CAN connection...", "");
+      setBusy(true);
+      try {
+        const url = params.toString() ? `/check-can?${params.toString()}` : "/check-can";
+        const response = await fetch(url, { method: "POST" });
+        const data = await response.json();
+        canConnected = data.ok === true;
+        canCheckRunning = false;
+        controllerEnabled = data.controller_enabled === true;
+        if (data.ok) {
+          setCanStatus(data.message || "CAN connected.", "ok");
+          setActivityMessage("CAN connected", data.message || "Ready.", false);
+        } else if (data.quiet === true) {
+          const quietMessage = data.error || data.message || "Switch On Power Supply.";
+          setCanStatus(quietMessage, "");
+          setActivityMessage("CAN check", quietMessage, false);
+        } else {
+          setCanStatus(data.error || "CAN connection failed.", "fail");
+          setActivityMessage("CAN connection failed", data.error || "Open Debug for details.", true);
+          setView("status");
+        }
+      } catch (error) {
+        canConnected = false;
+        canCheckRunning = false;
+        setCanStatus(`CAN check failed: ${error}`, "fail");
+        setActivityMessage("CAN check failed", String(error), true);
+        setView("status");
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    async function toggleControllerEnabled() {
+      if (!canConnected) {
+        return;
+      }
+      const nextEnabled = !controllerEnabled;
+      const params = new URLSearchParams({ enabled: nextEnabled ? "1" : "0" });
+      setBusy(true);
+      try {
+        const response = await fetch(`/controller-enable?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Controller command failed", data.error || "Could not change controller enable state.", true);
+          setView("status");
+        } else {
+          controllerEnabled = data.controller_enabled === true;
+          setActivityMessage("Controller state changed", data.message || "Ready.", false);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    async function clearControllerErrors() {
+      if (!canConnected) {
+        return;
+      }
+      const params = new URLSearchParams();
+      setBusy(true);
+      try {
+        const response = await fetch(`/clear-controller-errors?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Clear errors failed", data.error || "Could not clear controller errors.", true);
+          setView("status");
+        } else {
+          setActivityMessage("Controller errors cleared", data.message || "Ready.", false);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+        setView("status");
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    async function setPowerSupplyOutput(enabled) {
+      setBusy(true);
+      setActivityMessage(enabled ? "Turning power supply on" : "Turning power supply off", "Setting controller relays.", false);
+      setView("status");
+      const params = new URLSearchParams({ enabled: enabled ? "1" : "0" });
+      try {
+        const response = await fetch(`/power-supply-output?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Power supply command failed", data.error || "Could not control power supply.", true);
+        } else {
+          canConnected = data.can_connection_ok === true;
+          controllerEnabled = data.controller_enabled === true;
+          setActivityMessage(enabled ? "Power supply on" : "Power supply off", data.message || "Ready.", false);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    function updateRelayConnectionStatus(data) {
+      let text = "Error";
+      let ok = false;
+      let warn = false;
+      if (data.relay_connecting === true) {
+        text = "Connecting";
+        warn = true;
+      } else if (data.relay_connection_ok === true || data.ok === true) {
+        if (data.controller_power_relays_on === true) {
+          text = "ON";
+          ok = true;
+        } else {
+          text = "OFF";
+          warn = true;
+        }
+      } else if (data.controller_power_relays_on === true) {
+        text = "ON";
+        ok = true;
+      }
+      relayStatusBadgeEl.textContent = text;
+      relayStatusBadgeEl.classList.toggle("ok", ok);
+      relayStatusBadgeEl.classList.toggle("warn", warn);
+    }
+
+    function updateRelayPanel(data) {
+      updateRelayConnectionStatus(data);
+    }
+
+    eolSsiEncoderRestoreEl.checked = localStorage.getItem("eolSsiEncoderRestore") !== "0";
+    updateEolSsiEncoderValue();
+    eolSsiEncoderRestoreEl.addEventListener("change", updateEolSsiEncoderValue);
+
+    async function runRelayAction(action) {
+      const labels = {
+        power_on: "Powering controller on with relays...",
+        restart: "Restarting controller with relays...",
+        power_off: "Powering controller off with relays...",
+        operation: "Activating operation relays...",
+        test_all: "Testing all relays...",
+        end_all: "Disabling all relays...",
+        set_mask: "Setting relays...",
+        check_termination: "Checking CAN termination..."
+      };
+      setBusy(true);
+      setActivityMessage(labels[action] || "Setting relays", "Relay command in progress.", false);
+      setView("status");
+      const params = new URLSearchParams({ action });
+      try {
+        const response = await fetch(`/relays?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        updateRelayPanel(data);
+        if (!data.ok) {
+          setActivityMessage("Relay command failed", data.error || "Open Debug for details.", true);
+        } else {
+          setActivityMessage("Relay command complete", data.message || "Ready.", false);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    async function setRelayMode(mode) {
+      const params = new URLSearchParams({ mode });
+      try {
+        const response = await fetch(`/relay-mode?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Relay mode failed", data.error || "Could not set relay mode.", true);
+          await refreshStatus();
+          return;
+        }
+        setActivityMessage("Relay mode changed", `Task relay mode: ${data.relay_mode}.`, false);
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+      }
+      await refreshStatus();
+    }
+
+    buttons.forEach((button) => {
+      button.addEventListener("click", () => startTask(button.dataset.task));
+    });
+    workflowTabEls.forEach((tabEl) => {
+      tabEl.addEventListener("click", () => setWorkflowTab(tabEl.dataset.workflowTab));
+    });
+    scanOptionEl.addEventListener("change", async () => {
+      const params = new URLSearchParams({ option: scanOptionEl.value });
+      try {
+        const response = await fetch(`/scan-option?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        if (!data.ok) {
+          setActivityMessage("Scan option failed", data.error || "Could not set scan option.", true);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
+      }
+      await refreshStatus();
+    });
+    rescanProductEl.addEventListener("click", rescanProduct);
+
+    connectCanEl.addEventListener("click", () => checkCanConnection(true));
+    driveEnableEl.addEventListener("click", toggleControllerEnabled);
+    clearErrorsEl.addEventListener("click", clearControllerErrors);
+    relaysPowerOnEl.addEventListener("click", () => runRelayAction("power_on"));
+    relaysRestartEl.addEventListener("click", () => runRelayAction("restart"));
+    relaysCheckTerminationEl.addEventListener("click", () => runRelayAction("check_termination"));
+    relaysPowerOffEl.addEventListener("click", () => runRelayAction("power_off"));
+    relayModeEl.addEventListener("change", () => setRelayMode(relayModeEl.value));
+    eolLastReportEl.addEventListener("click", () => {
+      if (!eolReportUrl) {
+        return;
+      }
+      window.open(eolReportUrl, "_blank", "noopener");
+    });
+
+    rpmPlusEl.addEventListener("click", () => updateManualRpm(MANUAL_RPM_STEP));
+    rpmMinusEl.addEventListener("click", () => updateManualRpm(-MANUAL_RPM_STEP));
+    manualStopEl.addEventListener("click", () => manualSpin(0));
+    spinLeftEl.addEventListener("pointerdown", (event) => startHeldSpin(-1, event));
+    spinRightEl.addEventListener("pointerdown", (event) => startHeldSpin(1, event));
+    [spinLeftEl, spinRightEl].forEach((button) => {
+      button.addEventListener("pointerup", stopHeldSpin);
+      button.addEventListener("pointercancel", stopHeldSpin);
+      button.addEventListener("pointerleave", stopHeldSpin);
+      button.addEventListener("lostpointercapture", stopHeldSpin);
+    });
+    window.addEventListener("blur", stopHeldSpin);
+    window.addEventListener("pagehide", sendReleaseBeacon);
+
+    continuePowerCycleEl.addEventListener("click", async () => {
+      try {
+        const endpoint = awaitingRelayConfirmation
+          ? "/confirm-relay-step"
+          : "/confirm-power-cycle";
+        await fetch(endpoint, { method: "POST" });
+      } catch (error) {
+        setActivityMessage("Could not confirm", String(error), true);
+      }
+      await refreshStatus();
+    });
+
+    killAllEl.addEventListener("click", async () => {
+      setActivityMessage("Stopping all programs", "Kill All was pressed.", true);
+      try {
+        await fetch("/kill-all", { method: "POST" });
+      } catch (error) {
+        setActivityMessage("Programs stopped", `Server connection closed: ${error}`, true);
+      }
+    });
+
+    statusTabEl.addEventListener("click", () => setView("status"));
+    debugTabEl.addEventListener("click", () => setView("debug"));
+
+    document.querySelector("#clear-log").addEventListener("click", async () => {
+      try {
+        await fetch("/clear-log", { method: "POST" });
+      } catch (error) {
+        setActivityMessage("Could not clear debug log", String(error), true);
+      }
+      logEl.textContent = "";
+      setActivityMessage("Ready", "Choose one operation.", false);
+      lastLength = 0;
+      await refreshStatus();
+    });
+
+    setInterval(refreshStatus, 750);
+  </script>
+</body>
+</html>

@@ -1,8 +1,10 @@
 # drivers/driver_QRreader.py
 import os
+import subprocess
 import sys
 import time
 from pathlib import Path
+
 
 def _configure_qt_environment():
     for font_dir in (
@@ -26,39 +28,26 @@ import numpy as np
 _configure_qt_environment()
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from interrupt_guard import install_deferred_keyboard_interrupt
+from utils.interrupt_guard import install_deferred_keyboard_interrupt
 
-# Window / camera configuration
 WINDOW_NAME = "QR Reader"
 CAMERA_WIDTH = 1280
 CAMERA_HEIGHT = 720
 CAMERA_FPS = 30
 FULL_FRAME_FALLBACK_INTERVAL = 5
-
-# Fixed camera sticker area. Normalized as (x, y, width, height) so it
-# follows the actual capture resolution.
 STICKER_QR_ROI = (0.22, 0.34, 0.17, 0.30)
 
 
 def on_mouse(event, x, y, flags, userdata):
-    """Mouse callback for window interaction."""
     pass
 
 
 def _preprocess_variants(frame):
-    """
-    Build several representations of the same frame.
-    Different QR codes and lighting conditions respond better to different variants.
-    """
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-
     clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
     eq = clahe.apply(gray)
-
-    # Proper unsharp mask: original - blurred component
     blur = cv2.GaussianBlur(eq, (0, 0), 1.2)
     sharp = cv2.addWeighted(eq, 1.6, blur, -0.6, 0)
-
     th_adapt = cv2.adaptiveThreshold(
         sharp,
         255,
@@ -67,15 +56,12 @@ def _preprocess_variants(frame):
         31,
         3,
     )
-
     _, th_otsu = cv2.threshold(
         sharp,
         0,
         255,
         cv2.THRESH_BINARY + cv2.THRESH_OTSU,
     )
-
-    # Try original first, then progressively more aggressive preprocessing
     return [
         ("bgr", frame),
         ("gray", gray),
@@ -87,7 +73,6 @@ def _preprocess_variants(frame):
 
 
 def _rescale_points(points, scale):
-    """Scale QR corner points back to original image coordinates."""
     if points is None:
         return None
     pts = np.asarray(points, dtype=np.float32)
@@ -95,7 +80,6 @@ def _rescale_points(points, scale):
 
 
 def _offset_points(points, offset_x, offset_y):
-    """Move QR corner points from ROI-local coordinates to frame coordinates."""
     pts = _normalize_points(points)
     if pts is None:
         return None
@@ -127,8 +111,81 @@ def _preview_allowed(show):
     return True
 
 
+def _camera_candidates(camera, *env_names):
+    candidates = []
+
+    def add(value):
+        if value is None or value == "":
+            return
+        if isinstance(value, str) and value.isdigit():
+            value = int(value)
+        if value not in candidates:
+            candidates.append(value)
+
+    for env_name in env_names:
+        add(os.environ.get(env_name))
+    add(camera)
+
+    for dev_name in sorted(os.listdir("/dev") if os.path.isdir("/dev") else []):
+        if dev_name.startswith("video"):
+            suffix = dev_name[5:]
+            if suffix.isdigit():
+                add(int(suffix))
+
+    return candidates
+
+
+def _camera_busy_details():
+    devices = [
+        f"/dev/{name}"
+        for name in sorted(os.listdir("/dev") if os.path.isdir("/dev") else [])
+        if name.startswith("video")
+    ]
+    if not devices:
+        return "No /dev/video* devices found."
+    try:
+        result = subprocess.run(
+            ["fuser", "-v", *devices],
+            text=True,
+            capture_output=True,
+            timeout=2.0,
+            check=False,
+        )
+    except Exception:
+        return ""
+    return "\n".join(part.strip() for part in (result.stdout, result.stderr) if part.strip())
+
+
+def _open_camera_capture(camera=0, *env_names):
+    errors = []
+    for candidate in _camera_candidates(camera, *env_names):
+        attempts = []
+        if isinstance(candidate, int):
+            attempts.append((candidate, cv2.CAP_V4L2, f"camera index {candidate}"))
+        else:
+            attempts.append((candidate, cv2.CAP_V4L2, str(candidate)))
+            attempts.append((candidate, cv2.CAP_ANY, str(candidate)))
+
+        for source, backend, label in attempts:
+            cap = cv2.VideoCapture(source, backend)
+            if cap.isOpened():
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
+                cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                print(f"[INFO] Camera opened: {label}")
+                return cap
+            cap.release()
+            errors.append(label)
+
+    busy = _camera_busy_details()
+    message = f"Cannot open camera. Tried: {', '.join(errors) or camera}."
+    if busy:
+        message += f" Camera device users/details:\n{busy}"
+    raise RuntimeError(message)
+
+
 def _normalize_points(points):
-    """Ensure points are in shape (4, 2) if available."""
     if points is None:
         return None
     pts = np.asarray(points)
@@ -141,30 +198,22 @@ def _normalize_points(points):
 
 
 def _decode_with_fallback(detector, img):
-    """
-    Try multi-decode first, then single decode, then detect -> decode,
-    then detect -> decodeCurved.
-    Returns: list of (text, points)
-    """
     results = []
-
-    # 1) Multi-decode if supported
     if hasattr(detector, "detectAndDecodeMulti"):
         try:
             ok, texts, points, _ = detector.detectAndDecodeMulti(img)
             if ok and texts:
-                for i, t in enumerate(texts):
-                    if t:
+                for i, text in enumerate(texts):
+                    if text:
                         pts = None
                         if points is not None and len(points) > i:
                             pts = _normalize_points(points[i])
-                        results.append((t, pts))
+                        results.append((text, pts))
                 if results:
                     return results
         except Exception:
             pass
 
-    # 2) Single detect+decode
     try:
         text, points, _ = detector.detectAndDecode(img)
         if text:
@@ -172,19 +221,16 @@ def _decode_with_fallback(detector, img):
     except Exception:
         pass
 
-    # 3) detect -> decode / decodeCurved fallback
     try:
         ok, points = detector.detect(img)
         if ok and points is not None:
             pts = _normalize_points(points)
-
             try:
                 text, _ = detector.decode(img, points)
                 if text:
                     return [(text, pts)]
             except Exception:
                 pass
-
             if hasattr(detector, "decodeCurved"):
                 try:
                     text, _ = detector.decodeCurved(img, points)
@@ -199,15 +245,8 @@ def _decode_with_fallback(detector, img):
 
 
 def _scan_qr_image(detector, frame):
-    """
-    Try multiple image variants and scales.
-    Returns list of (text, points) in input-image coordinates.
-    """
     variants = _preprocess_variants(frame)
-
-    # Upscaling often helps when the QR code is small in the image
     scales = [1.0, 1.5, 2.0, 3.0]
-
     all_results = []
     seen_texts = set()
 
@@ -230,14 +269,10 @@ def _scan_qr_image(detector, frame):
             for text, pts in found:
                 if not text or text in seen_texts:
                     continue
-
                 seen_texts.add(text)
-
                 if pts is not None and scale != 1.0:
                     pts = _rescale_points(pts, scale)
-
-                pts = _normalize_points(pts)
-                all_results.append((text, pts))
+                all_results.append((text, _normalize_points(pts)))
 
             if all_results:
                 return all_results
@@ -246,10 +281,6 @@ def _scan_qr_image(detector, frame):
 
 
 def _find_qr(detector, frame, miss_count=0):
-    """
-    Scan the fixed sticker area first for speed, then occasionally retry the
-    whole frame as a recovery path if the part or camera position drifts.
-    """
     x, y, w, h = _roi_from_normalized(frame, STICKER_QR_ROI)
     roi_frame = frame[y:y + h, x:x + w]
 
@@ -270,38 +301,15 @@ def run_qr_reader(
     show: bool = True,
     once: bool = False,
     timeout: float = 0.0,
-    on_decode=None,          # optional callback(text:str, points:np.ndarray|None)
+    on_decode=None,
     return_first: bool = False,
     cap=None,
 ):
-    """
-    Start webcam QR reader.
-
-    Returns first decoded text if return_first=True, else None.
-
-    on_decode:
-        Called for every NEW text seen (deduplicated).
-        Signature: on_decode(text, points)
-        where points is a 4x2 corner array or None.
-    """
     owns_cap = cap is None
     if owns_cap:
-        # Prefer V4L2 on Linux
-        cap = cv2.VideoCapture(camera, cv2.CAP_V4L2)
-
-        if not cap.isOpened():
-            raise RuntimeError(f"Cannot open camera index {camera}")
-
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, CAMERA_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, CAMERA_HEIGHT)
-        cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
-
-        # Small buffer helps avoid stale frames
-        cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        cap = _open_camera_capture(camera, "QR_READER_CAMERA", "ST_CAMERA_DEVICE")
 
     detector = cv2.QRCodeDetector()
-
-    # Detector tuning. These setters may not exist in every OpenCV build.
     if hasattr(detector, "setEpsX"):
         detector.setEpsX(0.2)
     if hasattr(detector, "setEpsY"):
@@ -335,25 +343,17 @@ def run_qr_reader(
                 if text not in seen:
                     seen.add(text)
                     got_new = True
-
                     if on_decode:
                         on_decode(text, pts)
                     else:
                         print(text)
-
                     if return_first and first_text is None:
                         first_text = text
 
                 if show and pts is not None:
                     pts_i = pts.astype(int).reshape(-1, 2)
                     for j in range(4):
-                        cv2.line(
-                            frame,
-                            tuple(pts_i[j]),
-                            tuple(pts_i[(j + 1) % 4]),
-                            (0, 255, 0),
-                            2,
-                        )
+                        cv2.line(frame, tuple(pts_i[j]), tuple(pts_i[(j + 1) % 4]), (0, 255, 0), 2)
                     cx, cy = pts_i.mean(axis=0).astype(int)
                     cv2.circle(frame, (int(cx), int(cy)), 4, (0, 255, 0), -1)
                     cv2.putText(
@@ -370,31 +370,18 @@ def run_qr_reader(
                 now = time.time()
                 fps = 1.0 / max(now - prev_time, 1e-6)
                 prev_time = now
-
                 display_frame = frame.copy()
                 rx, ry, rw, rh = _roi_from_normalized(display_frame, STICKER_QR_ROI)
                 cv2.rectangle(display_frame, (rx, ry), (rx + rw, ry + rh), (255, 180, 0), 2)
-                fps_text = f"FPS: {fps:.1f}"
-                cv2.putText(
-                    display_frame,
-                    fps_text,
-                    (10, 28),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.8,
-                    (0, 255, 0),
-                    2,
-                )
-
+                cv2.putText(display_frame, f"FPS: {fps:.1f}", (10, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
                 cv2.imshow(WINDOW_NAME, display_frame)
                 if (cv2.waitKey(1) & 0xFF) == ord("q"):
                     break
 
             if once and got_new:
                 break
-
             if timeout and (time.time() - start_time) >= timeout:
                 break
-
     finally:
         if owns_cap and cap is not None:
             cap.release()
@@ -404,7 +391,7 @@ def run_qr_reader(
     return first_text if return_first else None
 
 
-if __name__ == "__main__":
+def _main():
     restore_sigint = install_deferred_keyboard_interrupt(label="QR reader")
     try:
         print("[INFO] Scanning QR code. Preview is disabled by default on Wayland.")
@@ -412,5 +399,10 @@ if __name__ == "__main__":
         if not qrcode:
             print("[ERROR] No QR detected. Aborting.")
             sys.exit(1)
+        print(qrcode)
     finally:
         restore_sigint()
+
+
+if __name__ == "__main__":
+    _main()

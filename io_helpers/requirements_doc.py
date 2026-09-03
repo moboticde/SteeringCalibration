@@ -1,9 +1,9 @@
 # io_helpers/requirements_doc.py
 import os
-from matplotlib import pyplot as plt
+from pathlib import Path
 import numpy as np
 import pandas as pd
-from io_helpers.find_product_folder import find_config
+from io_helpers import find_product_folder
 from openpyxl import load_workbook
 import zipfile
 import warnings  
@@ -18,38 +18,123 @@ def is_valid_xlsx(path):
         return False
 
 
+def safe_filename_token(value, fallback="scan"):
+    text = str(value or "").strip()
+    safe = "".join(ch if ch.isalnum() or ch in "-_." else "_" for ch in text)
+    safe = safe.strip("._")
+    return (safe or fallback)[:80]
+
+
+def find_product_spec_v2(product_dir):
+    product_path = Path(product_dir)
+
+    direct = product_path / "ProductSpecifications_V2.xlsx"
+    if direct.is_file():
+        return direct
+
+    child_matches = sorted(product_path.glob("*/ProductSpecifications_V2.xlsx"))
+    if child_matches:
+        return child_matches[0]
+
+    nested_matches = sorted(product_path.rglob("ProductSpecifications_V2.xlsx"))
+    if nested_matches:
+        return nested_matches[0]
+
+    raise FileNotFoundError(
+        f"No valid ProductSpecifications_V2.xlsx found under: {product_path}"
+    )
+
+
+def _normalized_product_key(value):
+    return "".join(ch for ch in str(value or "").upper() if ch.isalnum())
+
+
+def _configured_product_base_path():
+    config_data = getattr(find_product_folder, "config", None)
+    if not isinstance(config_data, dict):
+        return None
+    paths = config_data.get("paths", {})
+    if not isinstance(paths, dict):
+        return None
+    product_base = paths.get("product_base")
+    return Path(product_base) if product_base else None
+
+
+def resolve_product_family_dir(qr_code, product_dir_raw):
+    product_dir = Path(product_dir_raw).expanduser().resolve()
+    product_base = _configured_product_base_path()
+    if product_base is None:
+        return product_dir
+
+    base_dir = product_base.expanduser().resolve()
+    try:
+        relative_parts = product_dir.relative_to(base_dir).parts
+    except ValueError:
+        return product_dir
+
+    if not relative_parts:
+        return product_dir
+
+    family_dir = base_dir / relative_parts[0]
+    if _normalized_product_key(qr_code).startswith(_normalized_product_key(family_dir.name)):
+        return family_dir
+    return product_dir
+
+
+def resolve_product_spec_from_scan(scan_text):
+    text = str(scan_text or "").strip()
+    if not text:
+        raise ValueError("Empty QR code; cannot resolve product specification.")
+
+    scanned_path = Path(os.path.expanduser(text))
+    if scanned_path.exists():
+        scanned_path = scanned_path.resolve()
+        product_dir = scanned_path.parent if scanned_path.is_file() else scanned_path
+    else:
+        old_cwd = os.getcwd()
+        try:
+            product_dir_raw = find_product_folder.find_config(text)
+        finally:
+            try:
+                os.chdir(old_cwd)
+            except Exception:
+                pass
+        if not product_dir_raw:
+            raise FileNotFoundError(f"[ERROR] No matching folder found for QR code: {text}")
+        product_dir = resolve_product_family_dir(text, product_dir_raw)
+
+    spec_path = find_product_spec_v2(product_dir)
+    return product_dir, spec_path
+
+
 class ConfigReader:
     """Reads and stores configuration parameters and recepies from Excel files dynamically."""
 
-    def __init__(self, barcode):
-        self.path = find_config(barcode)  # Find the correct folder dynamically
-        if not self.path:
-            raise FileNotFoundError(f"[ERROR] No matching folder found for barcode: {barcode}")
+    def __init__(self, qr_code):
+        product_dir, spec_path = resolve_product_spec_from_scan(qr_code)
 
-        # Dynamically set base path for this barcode
+        # Dynamically set base path for this QR code.
+        self.path = os.fspath(product_dir)
         self.BASE_PATH = self.path
         self.RECEPIES_FOLDER = os.path.join(self.BASE_PATH, "02_EOL_Recepies")
-        self.PRODUCT_SPEC_V2 = os.path.join(self.BASE_PATH, "ProductSpecifications_V2.xlsx")
+        self.PRODUCT_SPEC_V2 = os.fspath(spec_path)
         self.PRODUCT_SPEC = os.path.join(self.BASE_PATH, "ProductSpecifications.xlsx")
         self.STEERING_APP_TEST_FILE = os.path.join(self.RECEPIES_FOLDER, "SteeringAppRecepie.xlsx")
         self.STEERING_MOTOR_TEST_FILE = os.path.join(self.RECEPIES_FOLDER, "SteeringMotorRecepie.xlsx")
         self.TRACTION_TEST_FILE = os.path.join(self.RECEPIES_FOLDER, "TractionRecepie.xlsx")
-        self.SAVE_RESULTS_PATH = os.path.join(self.BASE_PATH, "04_EOL_Results")
+        self.SAVE_RESULTS_PATH = os.path.join(self.BASE_PATH, "04_Results")
         os.makedirs(self.SAVE_RESULTS_PATH, exist_ok=True)
 
-        # Generate unique filename
-        excel_name = f"{barcode}_test.xlsx"
-        excel_path = os.path.join(self.SAVE_RESULTS_PATH, excel_name)
-
-        attempt = 0
-        final_path = excel_path
-        while os.path.exists(final_path):
-            attempt += 1
-            suffix = f" (copy{'' if attempt == 1 else f' {attempt}'})"
-            final_name = f"{barcode}_test{suffix}.xlsx"
-            final_path = os.path.join(self.SAVE_RESULTS_PATH, final_name)
-
-        self.results_excel_path = final_path
+        # Use the same workbook as CalibrationGUI. EOL appends its sheets to
+        # <serial>_status.xlsx and renames it to <serial>_done.xlsx on success.
+        result_token = safe_filename_token(qr_code, 'qr')
+        status_path = os.path.join(self.SAVE_RESULTS_PATH, f"{result_token}_status.xlsx")
+        done_path = os.path.join(self.SAVE_RESULTS_PATH, f"{result_token}_done.xlsx")
+        self.results_excel_path = (
+            status_path
+            if os.path.exists(status_path) or not os.path.exists(done_path)
+            else done_path
+        )
 
         if not os.path.exists(self.results_excel_path):
             with pd.ExcelWriter(self.results_excel_path, engine='openpyxl', mode='w') as writer:
@@ -63,10 +148,11 @@ class ConfigReader:
 
     def load_config(self):
         """Loads configuration from the available Excel file dynamically."""
-        if os.path.exists(self.PRODUCT_SPEC_V2):
+        if os.path.exists(self.PRODUCT_SPEC_V2) and is_valid_xlsx(self.PRODUCT_SPEC_V2):
+            print(f"[INFO] Loading product specification: {self.PRODUCT_SPEC_V2}")
             self._read_spec(self.PRODUCT_SPEC_V2)
         else:
-            raise FileNotFoundError("No valid product specification file found.")
+            raise FileNotFoundError(f"No valid product specification file found: {self.PRODUCT_SPEC_V2}")
 
     def _read_spec(self, filepath):
         """Reads all parameters from the available specification file dynamically."""
@@ -113,53 +199,120 @@ class ConfigReader:
             del book['init']
             book.save(self.results_excel_path)
 
+    @staticmethod
+    def _match_value_is_blank(value):
+        if pd.isna(value):
+            return True
+        return str(value).strip() == ""
+
+    @staticmethod
+    def _match_value_is_true(value):
+        if isinstance(value, (bool, np.bool_)):
+            return bool(value)
+        if isinstance(value, (int, float)) and not pd.isna(value):
+            return float(value) == 1.0
+        return str(value).strip().lower() in {"true", "1", "yes", "ok"}
+
+    def general_sheets_all_match(self):
+        try:
+            xls = pd.ExcelFile(self.results_excel_path, engine="openpyxl")
+        except FileNotFoundError:
+            return False
+
+        general_sheets = [sheet for sheet in xls.sheet_names if sheet.startswith("general")]
+        if not general_sheets:
+            return False
+
+        checked_any = False
+        for sheet in general_sheets:
+            df = pd.read_excel(self.results_excel_path, sheet_name=sheet, engine="openpyxl")
+            if "Match" not in df.columns:
+                return False
+            for value in df["Match"].tolist():
+                if self._match_value_is_blank(value):
+                    continue
+                checked_any = True
+                if not self._match_value_is_true(value):
+                    return False
+        return checked_any
+
+    def rename_status_to_done_if_eol_ok(self):
+        if not self.general_sheets_all_match():
+            return False
+
+        current_path = Path(self.results_excel_path)
+        if current_path.stem.endswith("_done"):
+            return True
+        if not current_path.stem.endswith("_status"):
+            return False
+
+        done_path = current_path.with_name(
+            f"{current_path.stem[:-len('_status')]}_done{current_path.suffix}"
+        )
+        current_path.replace(done_path)
+        self.results_excel_path = os.fspath(done_path)
+        print(f"[INFO] EOL successful. Result workbook renamed to: {done_path}")
+        return True
+
 
     def extract_brake_feedback(self, dp, pg, brake_torque):
         fragments = []
+        try:
+            workbook_sheets = set(pd.ExcelFile(self.results_excel_path, engine="openpyxl").sheet_names)
+        except FileNotFoundError:
+            print(f"[WARNING] Cannot build brake report; workbook not found: {self.results_excel_path}")
+            return fragments
+
         for idx, sheet_name in enumerate(["brake_test_forward", "brake_test_backward"]):
-            actual_df = pd.read_excel(self.results_excel_path, sheet_name=sheet_name)
-            fig_parts = []
+            if sheet_name not in workbook_sheets:
+                print(f"[INFO] Skipping brake report section {sheet_name}: sheet was not produced in this run.")
+                continue
+            try:
+                actual_df = pd.read_excel(self.results_excel_path, sheet_name=sheet_name, engine="openpyxl")
+                fig_parts = []
 
-            include_js = 'cdn' if idx == 0 else False
+                include_js = 'cdn' if idx == 0 else False
 
-            # Braking current (only when brake is active)
-            brake_current = actual_df.loc[actual_df["brake activated"] == 1, "RMS current"]
-            avg_current = brake_current.mean()
-            Kt_estimated = brake_torque / avg_current if avg_current != 0 else 0.1
+                # Braking current (only when brake is active)
+                brake_current = actual_df.loc[actual_df["brake activated"] == 1, "RMS current"]
+                avg_current = brake_current.mean()
+                Kt_estimated = brake_torque / avg_current if avg_current != 0 else 0.1
 
-            # --- RMS Current + Brake Activation ---
-            fig_current = pg.plot_current_with_brake(
-                time_list=actual_df['time(S)'].values,
-                current=actual_df['RMS current'].values,
-                brake_signal=actual_df['brake activated'].astype(int).values,
-                title=f"{sheet_name.replace('_', ' ').title()} - Current"
-            )
-            fig_parts.append(fig_current.to_html(full_html=False, include_plotlyjs=include_js))
+                # --- RMS Current + Brake Activation ---
+                fig_current = pg.plot_current_with_brake(
+                    time_list=actual_df['time(S)'].values,
+                    current=actual_df['RMS current'].values,
+                    brake_signal=actual_df['brake activated'].astype(int).values,
+                    title=f"{sheet_name.replace('_', ' ').title()} - Current"
+                )
+                fig_parts.append(fig_current.to_html(full_html=False, include_plotlyjs=include_js))
 
-            # --- Traction Feedback + Brake Activation ---
-            fig_speed = pg.plot_speed_with_brake(
-                time_list=actual_df['time(S)'].values,
-                speed=actual_df['Traction feedback'].values,
-                brake_signal=actual_df['brake activated'].astype(int).values,
-                title=f"{sheet_name.replace('_', ' ').title()} - Speed"
-            )
-            fig_parts.append(fig_speed.to_html(full_html=False, include_plotlyjs=include_js))
+                # --- Traction Feedback + Brake Activation ---
+                fig_speed = pg.plot_speed_with_brake(
+                    time_list=actual_df['time(S)'].values,
+                    speed=actual_df['Traction feedback'].values,
+                    brake_signal=actual_df['brake activated'].astype(int).values,
+                    title=f"{sheet_name.replace('_', ' ').title()} - Speed"
+                )
+                fig_parts.append(fig_speed.to_html(full_html=False, include_plotlyjs=include_js))
 
-            # --- Brake Energy ---
-            fig_energy = pg.plot_energy_comparison(
-                time_list=actual_df["time(S)"].values,
-                current_list=actual_df["RMS current"].values,
-                speed_rpm_list=actual_df["Traction feedback"].values,
-                voltage=48,
-                kt=Kt_estimated,
-                title=f"{sheet_name.replace('_', ' ').title()} - Energy Comparison"
-            )
-            fig_parts.append(fig_energy.to_html(full_html=False, include_plotlyjs=include_js))
+                # --- Brake Energy ---
+                fig_energy = pg.plot_energy_comparison(
+                    time_list=actual_df["time(S)"].values,
+                    current_list=actual_df["RMS current"].values,
+                    speed_rpm_list=actual_df["Traction feedback"].values,
+                    voltage=48,
+                    kt=Kt_estimated,
+                    title=f"{sheet_name.replace('_', ' ').title()} - Energy Comparison"
+                )
+                fig_parts.append(fig_energy.to_html(full_html=False, include_plotlyjs=include_js))
 
-            fragments.append({
-                "title": sheet_name.replace("_", " ").title(),
-                "figs": fig_parts
-            })
+                fragments.append({
+                    "title": sheet_name.replace("_", " ").title(),
+                    "figs": fig_parts
+                })
+            except (ValueError, FileNotFoundError, KeyError) as exc:
+                print(f"[INFO] Skipping brake report section {sheet_name}: {exc}")
         return fragments
 
     def extract_motor_combined_feedback(self, dp, pg):
@@ -171,7 +324,7 @@ class ConfigReader:
                 "sheet": "traction_test",
                 "csv_pattern": "*_traction_motor_test.csv",
                 "rename": {},
-                "type": "feedback",  # with setpoints
+                "type": "feedback",
             },
             {
                 "title": "Steering",
@@ -181,115 +334,152 @@ class ConfigReader:
                     'speed_p': 'set point',
                     'feedback_speed': 'Traction feedback'
                 },
-                "type": "feedback",  # with setpoints
+                "type": "feedback",
             },
             {
                 "title": "Steering App",
                 "sheet": "steering_app",
                 "csv_pattern": "*_steering_app_test.csv",
                 "rename": {},
-                "type": "position",  # no setpoints
+                "type": "position",
             }
         ]
 
-        for i, test in enumerate(motor_tests):
-            try:
-                sheet = test["sheet"]
-                csv_pattern = test["csv_pattern"]
-                title = test["title"]
-                rename_map = test["rename"]
-                test_type = test["type"]
+        try:
+            workbook_sheets = set(pd.ExcelFile(self.results_excel_path, engine="openpyxl").sheet_names)
+        except FileNotFoundError:
+            print(f"[WARNING] Cannot build motor report; workbook not found: {self.results_excel_path}")
+            return result_sections
 
-                actual_df = pd.read_excel(self.results_excel_path, sheet_name=sheet)
+        def has_numeric_data(df, column):
+            return column in df.columns and pd.to_numeric(df[column], errors="coerce").notna().any()
+
+        def raw_pairs(df, value_column):
+            return df[['time(S)', value_column]].values.tolist()
+
+        for test in motor_tests:
+            sheet = test["sheet"]
+            title = test["title"]
+            rename_map = test["rename"]
+            test_type = test["type"]
+
+            if sheet not in workbook_sheets:
+                print(f"[INFO] Skipping {title} report section: sheet '{sheet}' was not produced in this run.")
+                continue
+
+            try:
+                actual_df = pd.read_excel(self.results_excel_path, sheet_name=sheet, engine="openpyxl")
                 if rename_map:
                     actual_df = actual_df.rename(columns=rename_map)
 
-                all_df, avg_df = dp.all_files(
-                    self.SAVE_RESULTS_PATH,
-                    csv_pattern,
-                    sheet,
-                    os.path.basename(self.results_excel_path)
-                )
-                if rename_map:
-                    avg_df = avg_df.rename(columns=rename_map)
+                try:
+                    _all_df, avg_df = dp.all_files(
+                        self.SAVE_RESULTS_PATH,
+                        test["csv_pattern"],
+                        sheet,
+                        os.path.basename(self.results_excel_path)
+                    )
+                    if rename_map:
+                        avg_df = avg_df.rename(columns=rename_map)
+                except ValueError:
+                    print(f"[INFO] No comparison history for {title}; plotting current run only.")
+                    avg_df = actual_df.copy()
 
                 fig_parts = []
 
                 if test_type == "feedback":
-                    # Raw values
-                    raw_current = actual_df[['time(S)', 'current A']].values.tolist()
-                    raw_temp = actual_df[['time(S)', 'temperature']].values.tolist() if 'temperature' in actual_df.columns else [[t, None] for t in actual_df['time(S)']]
-                    raw_rms_current = actual_df[['time(S)', 'RMS current']].values.tolist()
-                    raw_speed = actual_df[['time(S)', 'Traction feedback']].values.tolist()
-
-                    # Statistics
-                    actual_current = dp.min_max_avg(actual_df, 'current A')
-                    actual_temp = dp.min_max_avg(actual_df, 'temperature') if 'temperature' in actual_df.columns else actual_current * 0
-                    actual_rms_current = dp.min_max_avg(actual_df, 'RMS current')
-                    actual_speed = dp.min_max_avg(actual_df, 'Traction feedback')
-
-                    # General raw
-                    gen_raw_current = avg_df[['time(S)', 'current A']].values.tolist()
-                    gen_raw_temp = avg_df[['time(S)', 'temperature']].values.tolist() if 'temperature' in avg_df.columns else [[t, None] for t in avg_df['time(S)']]
-                    gen_raw_rms_current = avg_df[['time(S)', 'RMS current']].values.tolist()
-                    gen_raw_speed = avg_df[['time(S)', 'Traction feedback']].values.tolist()
-
-                    # General stats
-                    general_current = dp.min_max_avg(avg_df, 'current A')
-                    general_temp = dp.min_max_avg(avg_df, 'temperature') if 'temperature' in avg_df.columns else general_current * 0
-                    general_rms_current = dp.min_max_avg(avg_df, 'RMS current')
-                    general_speed = dp.min_max_avg(avg_df, 'Traction feedback')
+                    required = {'time(S)', 'set point', 'Traction feedback'}
+                    missing_required = sorted(required - set(actual_df.columns))
+                    if missing_required:
+                        raise KeyError(f"missing required columns: {missing_required}")
 
                     data_dict = {
-                        "DC Motor Current": (raw_current, actual_current, gen_raw_current, general_current),
-                        "RMS Current": (raw_rms_current, actual_rms_current, gen_raw_rms_current, general_rms_current),
-                        "Speed RPM": (raw_speed, actual_speed, gen_raw_speed, general_speed),
-                        "Temperature": (raw_temp, actual_temp, gen_raw_temp, general_temp),
+                        "Speed RPM": (
+                            raw_pairs(actual_df, 'Traction feedback'),
+                            dp.min_max_avg(actual_df, 'Traction feedback'),
+                            raw_pairs(avg_df, 'Traction feedback'),
+                            dp.min_max_avg(avg_df, 'Traction feedback'),
+                        )
                     }
 
-                    for j, (param_name, data) in enumerate(data_dict.items()):
+                    optional_columns = [
+                        ("DC Motor Current", "current A"),
+                        ("RMS Current", "RMS current"),
+                        ("Temperature", "temperature"),
+                    ]
+                    for param_name, column in optional_columns:
+                        if has_numeric_data(actual_df, column) and has_numeric_data(avg_df, column):
+                            data_dict[param_name] = (
+                                raw_pairs(actual_df, column),
+                                dp.min_max_avg(actual_df, column),
+                                raw_pairs(avg_df, column),
+                                dp.min_max_avg(avg_df, column),
+                            )
+                        else:
+                            print(f"[INFO] Skipping {title} {param_name} plot: no numeric '{column}' data.")
+
+                    for param_name, data in data_dict.items():
                         fig = pg.plot_motor_feedback(param_name, data)
-                        fig_parts.append(fig.to_html(full_html=False, include_plotlyjs='cdn' if j == 0 else False))
+                        include_js = 'cdn' if not fig_parts else False
+                        fig_parts.append(fig.to_html(full_html=False, include_plotlyjs=include_js))
 
                 elif test_type == "position":
-                    raw_pos_input = actual_df[['time(S)', 'position input']].values.tolist()
-                    raw_pos_feedback = actual_df[['time(S)', 'position feedback']].values.tolist()
-                    raw_rms_current = actual_df[['time(S)', 'RMS current']].values.tolist()
+                    required = {'time(S)', 'position input', 'position feedback'}
+                    missing_required = sorted(required - set(actual_df.columns))
+                    if missing_required:
+                        raise KeyError(f"missing required columns: {missing_required}")
 
-                    gen_pos_input = avg_df[['time(S)', 'position input']].values.tolist()
-                    gen_pos_feedback = avg_df[['time(S)', 'position feedback']].values.tolist()
-                    gen_rms_current = avg_df[['time(S)', 'RMS current']].values.tolist()
-
-                    # Now safe to use these variables
-                    fig_parts.append(
-                        pg.plot_motor_app_feedback("Position Feedback", raw_pos_feedback, gen_pos_feedback, raw_input=raw_pos_input)
-                            .to_html(full_html=False, include_plotlyjs=False)
-                    )
+                    raw_pos_input = raw_pairs(actual_df, 'position input')
+                    raw_pos_feedback = raw_pairs(actual_df, 'position feedback')
+                    gen_pos_feedback = raw_pairs(avg_df, 'position feedback')
 
                     fig_parts.append(
-                        pg.plot_motor_app_feedback("RMS Current", raw_rms_current, gen_rms_current, raw_input=raw_pos_input)
-                            .to_html(full_html=False, include_plotlyjs=False)
+                        pg.plot_motor_app_feedback(
+                            "Position Feedback",
+                            raw_pos_feedback,
+                            gen_pos_feedback,
+                            raw_input=raw_pos_input,
+                        ).to_html(full_html=False, include_plotlyjs='cdn')
                     )
 
-                result_sections.append({"title": title, "figs": fig_parts})
+                    if has_numeric_data(actual_df, 'RMS current') and has_numeric_data(avg_df, 'RMS current'):
+                        fig_parts.append(
+                            pg.plot_motor_app_feedback(
+                                "RMS Current",
+                                raw_pairs(actual_df, 'RMS current'),
+                                raw_pairs(avg_df, 'RMS current'),
+                                raw_input=raw_pos_input,
+                            ).to_html(full_html=False, include_plotlyjs=False)
+                        )
+                    else:
+                        print("[INFO] Skipping Steering App RMS Current plot: no numeric 'RMS current' data.")
+
+                if fig_parts:
+                    result_sections.append({"title": title, "figs": fig_parts})
 
             except Exception as e:
-                print(f"")
+                print(f"[WARNING] Skipping {sheet} report section: {e}")
 
         return result_sections
     
     def check_calibration_status(self, dp):
-        actual_df = pd.read_excel(self.results_excel_path, sheet_name='traction_test')
-        actual_current = dp.min_max_avg(actual_df, 'current A')
-        df_actual = pd.DataFrame(actual_current, columns=['setpoint', 'min', 'max', 'avg'])
-        
-        df_actual = df_actual.dropna(subset=['min', 'max'])
-        
-        # Calibration check: if any interval exceeds the threshold
-        if ((df_actual['max'] - df_actual['min']) > 0.2).any():
-            return "not calibrated"
-        else:
+        try:
+            actual_df = pd.read_excel(self.results_excel_path, sheet_name='traction_test')
+            actual_current = dp.min_max_avg(actual_df, 'current A')
+            df_actual = pd.DataFrame(actual_current, columns=['setpoint', 'min', 'max', 'avg'])
+
+            df_actual = df_actual.dropna(subset=['min', 'max'])
+
+            # Calibration check: if any interval exceeds the threshold
+            if ((df_actual['max'] - df_actual['min']) > 0.2).any():
+                return "not calibrated"
             return "ok"
+        except ValueError:
+            print("[INFO] Traction calibration status unavailable: sheet 'traction_test' was not produced in this run.")
+            return "not available"
+        except (FileNotFoundError, KeyError) as exc:
+            print(f"[INFO] Traction calibration status unavailable: {exc}")
+            return "not available"
         
     
     # Get metadata
@@ -306,8 +496,8 @@ class ConfigReader:
             try:
                 df = pd.read_excel(self.results_excel_path, sheet_name=sheet, engine='openpyxl')
                 for _, row in df.iterrows():
-                    param = str(row.get('Parameter', '')).strip()
-                    value = row.get('Value', '')
+                    param = str(row.get('Parameters', row.get('Parameter', ''))).strip()
+                    value = row.get('Controller', row.get('Value', ''))
                     # flatten dict cell if needed
                     if isinstance(value, dict) and value:
                         value = list(value.values())[0]
@@ -336,11 +526,18 @@ class ConfigReader:
 
         
     # Rendering plots in HTML tabs
-    def render_tabs_html(self, unit_serial_number, sections, metadata):
+    def render_tabs_html(self, unit_serial_number, sections=None, metadata=None):
         """
         Renders plot sections into an HTML report with tabs,
         showing traction metadata on the left and steering on the right (only if exists).
         """
+        if metadata is None:
+            metadata = sections or {}
+            sections = unit_serial_number or []
+            unit_serial_number = Path(self.results_excel_path).stem
+            if unit_serial_number.endswith("_test"):
+                unit_serial_number = unit_serial_number[:-5]
+
         plot_name = f"{unit_serial_number}_plots_tabs.html"
         raw_path = os.path.join(self.SAVE_RESULTS_PATH, plot_name)
         plot_path = self.get_unique_filename(raw_path)
@@ -409,12 +606,13 @@ class ConfigReader:
 
             f.write("</body></html>")
 
-        os.startfile(plot_path)
+        try:
+            if hasattr(os, "startfile"):
+                os.startfile(plot_path)
+            else:
+                import webbrowser
+
+                webbrowser.open(Path(plot_path).resolve().as_uri())
+        except Exception as exc:
+            print(f"[WARNING] Could not open HTML report automatically: {exc}")
         return plot_path
-
-
-
-
-
-
-

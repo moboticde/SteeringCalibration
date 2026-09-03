@@ -8,7 +8,7 @@ from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-from interrupt_guard import install_deferred_keyboard_interrupt
+from utils.interrupt_guard import install_deferred_keyboard_interrupt
 
 # ------------------- CONFIG -------------------
 CAMERA_ID = int(os.environ.get("ST_CAMERA_ID", "0"))

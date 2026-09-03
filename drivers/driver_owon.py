@@ -120,8 +120,9 @@ class OwonSPE6053:
             os.close(self.usbtmc_fd)
             self.usbtmc_fd = None
 
-    def write(self, command: str) -> None:
-        print(f"[DEBUG] OWON <- {command}")
+    def write(self, command: str, *, log: bool = True) -> None:
+        if log:
+            print(f"[DEBUG] OWON <- {command}")
         if self.backend == "visa":
             self.visa_resource.write(command)
         elif self.backend == "usbtmc":
@@ -130,6 +131,12 @@ class OwonSPE6053:
             self.serial.write(f"{command}\r\n".encode("ascii"))
             self.serial.flush()
         time.sleep(0.05)
+
+    def write_batch(self, description: str, commands) -> None:
+        commands = tuple(commands)
+        print(f"[DEBUG] OWON <- {description} ({len(commands)} command variants)")
+        for command in commands:
+            self.write(command, log=False)
 
     def query(self, command: str) -> str:
         if self.backend == "visa":
@@ -158,32 +165,36 @@ class OwonSPE6053:
             return ""
 
     def configure_output(self, voltage_v: float, current_a: float) -> None:
-        for command in (
-            f"VOLT {voltage_v:.3f}",
-            f"VOLTage {voltage_v:.3f}",
-            f":VOLTage {voltage_v:.3f}",
-            f"CURR {current_a:.3f}",
-            f"CURRent {current_a:.3f}",
-            f":CURRent {current_a:.3f}",
-            f"VSET1:{voltage_v:.3f}",
-            f"ISET1:{current_a:.3f}",
-        ):
-            self.write(command)
+        self.write_batch(
+            f"configure output {voltage_v:.3f} V, {current_a:.3f} A",
+            (
+                f"VOLT {voltage_v:.3f}",
+                f"VOLTage {voltage_v:.3f}",
+                f":VOLTage {voltage_v:.3f}",
+                f"CURR {current_a:.3f}",
+                f"CURRent {current_a:.3f}",
+                f":CURRent {current_a:.3f}",
+                f"VSET1:{voltage_v:.3f}",
+                f"ISET1:{current_a:.3f}",
+            ),
+        )
 
     def set_output(self, enabled: bool) -> None:
         state = "ON" if enabled else "OFF"
         numeric_state = "1" if enabled else "0"
-        for command in (
-            f"OUT{numeric_state}",
-            f"OUTP {state}",
-            f"OUTPut {state}",
-            f":OUTPut {state}",
-            f"OUTP:STAT {state}",
-            f"OUTP:STAT {numeric_state}",
-            f":OUTPut:STATe {state}",
-            f":OUTPut:STATe {numeric_state}",
-        ):
-            self.write(command)
+        self.write_batch(
+            f"set output {state}",
+            (
+                f"OUT{numeric_state}",
+                f"OUTP {state}",
+                f"OUTPut {state}",
+                f":OUTPut {state}",
+                f"OUTP:STAT {state}",
+                f"OUTP:STAT {numeric_state}",
+                f":OUTPut:STATe {state}",
+                f":OUTPut:STATe {numeric_state}",
+            ),
+        )
 
     def power_cycle(
         self,
