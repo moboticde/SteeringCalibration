@@ -190,14 +190,19 @@ class FullCalibrationProtectionTests(unittest.TestCase):
         self.assertIn(("position", 0), mic.commands)
         self.assertFalse(mic.zero_saved)
 
-    def test_final_eeprom_store_rebuilds_derived_offsets_before_write_all(self):
+    def test_final_eeprom_store_rebuilds_derived_offsets_before_eeprom_write(self):
         calls: list[tuple[str, int | None]] = []
 
         original_set_param = fc.mu.MU_SetParam
         original_write_cmd = fc.mu.MU_WriteCmdRegister
+        original_write_eeprom = fc.mu.MU_WriteEeprom
         try:
             def fake_write_cmd(_handle, command):
                 calls.append(("cmd", int(command.value)))
+                return fc.MU_OK
+
+            def fake_write_eeprom(_handle, area):
+                calls.append(("eeprom", int(area.value)))
                 return fc.MU_OK
 
             def fake_set_param(_handle, index, _high, low, flag):
@@ -207,6 +212,7 @@ class FullCalibrationProtectionTests(unittest.TestCase):
                 return fc.MU_OK
 
             fc.mu.MU_WriteCmdRegister = fake_write_cmd
+            fc.mu.MU_WriteEeprom = fake_write_eeprom
             fc.mu.MU_SetParam = fake_set_param
 
             self.assertTrue(
@@ -215,15 +221,85 @@ class FullCalibrationProtectionTests(unittest.TestCase):
         finally:
             fc.mu.MU_SetParam = original_set_param
             fc.mu.MU_WriteCmdRegister = original_write_cmd
+            fc.mu.MU_WriteEeprom = original_write_eeprom
 
         self.assertEqual(
             calls,
             [
                 ("cmd", fc.MU_CMD_CRC_CALC.value),
                 ("cmd", fc.MU_CMD_ABS_RESET.value),
-                ("cmd", fc.MU_CMD_WRITE_ALL.value),
+                ("eeprom", fc.MU_E2P_CFG.value),
                 ("set_param", fc.MU_MODEA.value),
-                ("cmd", fc.MU_CMD_WRITE_ALL.value),
+                ("eeprom", fc.MU_E2P_CFG.value),
+            ],
+        )
+
+    def test_failed_calibration_restore_persists_original_config_to_eeprom(self):
+        calls: list[tuple[str, object]] = []
+        events: list[dict[str, object]] = []
+
+        def param(index, name, low, high=0):
+            return fc.ProtectedMuParam(index=index, name=name, high=high, low=low)
+
+        protected_state = fc.ProtectedZeroState(
+            params={
+                fc.MU_OFF_ABZ.value: param(fc.MU_OFF_ABZ.value, "OFF_ABZ", 0x1234),
+                fc.MU_OFF_UVW.value: param(fc.MU_OFF_UVW.value, "OFF_UVW", 0x5678),
+                fc.MU_PRES_POS.value: param(fc.MU_PRES_POS.value, "PRES_POS", 0),
+            },
+            derived_params={
+                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x100),
+                fc.MU_OFF_COM.value: param(fc.MU_OFF_COM.value, "OFF_COM", 0x200),
+            },
+            real_pres_pos_high=0,
+            real_pres_pos_low=0,
+        )
+
+        original_load_config = fc._load_mu_config
+        original_write_preserving = fc._write_params_preserving
+        original_store = fc._store_to_eeprom_and_set_mode
+        try:
+            fc._load_mu_config = (
+                lambda _handle, path: calls.append(("load", str(path))) or True
+            )
+            fc._write_params_preserving = (
+                lambda _handle, state, label: calls.append(
+                    ("ram_restore", label, state is protected_state)
+                )
+                or fc.MU_OK
+            )
+            fc._store_to_eeprom_and_set_mode = (
+                lambda _handle, mode, state: calls.append(
+                    ("eeprom_store", int(mode.value), state is protected_state)
+                )
+                or True
+            )
+
+            restored = fc._restore_original_config_after_failed_calibration(
+                fc.MU_Handle(),
+                Path("/tmp/original.cfg"),
+                protected_state,
+                events.append,
+            )
+        finally:
+            fc._load_mu_config = original_load_config
+            fc._write_params_preserving = original_write_preserving
+            fc._store_to_eeprom_and_set_mode = original_store
+
+        self.assertTrue(restored)
+        self.assertEqual(
+            calls,
+            [
+                ("load", "/tmp/original.cfg"),
+                ("ram_restore", "restore original config after failed calibration", True),
+                ("eeprom_store", fc.MU_SSI.value, True),
+            ],
+        )
+        self.assertEqual(
+            [(event["label"], event["ok"], event["return_code"]) for event in events],
+            [
+                ("restore original config after failed calibration", True, fc.MU_OK),
+                ("store restored original config after failed calibration", True, fc.MU_OK),
             ],
         )
 
@@ -358,7 +434,7 @@ class FullCalibrationProtectionTests(unittest.TestCase):
                 fc.MU_PRES_POS.value: param(fc.MU_PRES_POS.value, "PRES_POS", 0),
             },
             derived_params={
-                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x0000001F),
+                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x0000003F),
                 fc.MU_OFF_COM.value: param(fc.MU_OFF_COM.value, "OFF_COM", 0x00000580),
             },
             real_pres_pos_high=0,
@@ -370,7 +446,7 @@ class FullCalibrationProtectionTests(unittest.TestCase):
                 fc.MU_OFF_ABZ.value: param(
                     fc.MU_OFF_ABZ.value,
                     "OFF_ABZ",
-                    0xFFCF4EDC,
+                    0xFFCD4EDC,
                     high=0xF,
                 ),
                 fc.MU_OFF_UVW.value: param(fc.MU_OFF_UVW.value, "OFF_UVW", 0),
@@ -422,9 +498,101 @@ class FullCalibrationProtectionTests(unittest.TestCase):
         self.assertIsNotNone(result)
         assert result is not None
         self.assertEqual(result.params[fc.MU_OFF_ABZ.value].high, 0xF)
-        self.assertEqual(result.params[fc.MU_OFF_ABZ.value].low, 0xFFCF4EDC)
+        self.assertEqual(result.params[fc.MU_OFF_ABZ.value].low, 0xFFCD4EDC)
         self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFD14EDC), calls)
-        self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFCF4EDC), calls)
+        self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFCD4EDC), calls)
+
+    def test_encoder_side_zero_compensation_accepts_small_wrap_residual(self):
+        calls: list[tuple[str, int, int, int]] = []
+
+        def param(index, name, low, high=0):
+            return fc.ProtectedMuParam(index=index, name=name, high=high, low=low)
+
+        baseline = fc.ProtectedZeroState(
+            params={
+                fc.MU_OFF_ABZ.value: param(fc.MU_OFF_ABZ.value, "OFF_ABZ", 0x00014EDC),
+                fc.MU_OFF_UVW.value: param(fc.MU_OFF_UVW.value, "OFF_UVW", 0),
+                fc.MU_PRES_POS.value: param(fc.MU_PRES_POS.value, "PRES_POS", 0),
+            },
+            derived_params={
+                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x00FFFFFF),
+                fc.MU_OFF_COM.value: param(fc.MU_OFF_COM.value, "OFF_COM", 0x00000580),
+            },
+            real_pres_pos_high=0,
+            real_pres_pos_low=0,
+        )
+        after_abs_reset = fc.ProtectedZeroState(
+            params=baseline.params,
+            derived_params={
+                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x000002FF),
+                fc.MU_OFF_COM.value: param(fc.MU_OFF_COM.value, "OFF_COM", 0x00000580),
+            },
+            real_pres_pos_high=0,
+            real_pres_pos_low=0,
+        )
+        small_residual = fc.ProtectedZeroState(
+            params={
+                fc.MU_OFF_ABZ.value: param(
+                    fc.MU_OFF_ABZ.value,
+                    "OFF_ABZ",
+                    0xFFD14EDC,
+                    high=0xF,
+                ),
+                fc.MU_OFF_UVW.value: param(fc.MU_OFF_UVW.value, "OFF_UVW", 0),
+                fc.MU_PRES_POS.value: param(fc.MU_PRES_POS.value, "PRES_POS", 0),
+            },
+            derived_params={
+                fc.MU_OFF_POS.value: param(fc.MU_OFF_POS.value, "OFF_POS", 0x0000001F),
+                fc.MU_OFF_COM.value: param(fc.MU_OFF_COM.value, "OFF_COM", 0x00000580),
+            },
+            real_pres_pos_high=0,
+            real_pres_pos_low=0,
+        )
+
+        captures = [after_abs_reset, small_residual]
+        original_capture = fc._capture_protected_params
+        original_read_param = fc._read_param
+        original_set_param = fc.mu.MU_SetParam
+        original_write_params = fc.mu.MU_WriteParams
+        original_write_cmd = fc.mu.MU_WriteCmdRegister
+        try:
+            fc._capture_protected_params = lambda _handle, _label: captures.pop(0)
+            fc._read_param = (
+                lambda _handle, index, name: param(index, name, 5)
+                if index == fc.MU_MPC.value
+                else original_read_param(_handle, index, name)
+            )
+
+            def fake_set_param(_handle, index, high, low, _flag):
+                calls.append(("set_param", int(index.value), int(high.value), int(low.value)))
+                return fc.MU_OK
+
+            def fake_write_cmd(_handle, command):
+                calls.append(("cmd", int(command.value), 0, 0))
+                return fc.MU_OK
+
+            fc.mu.MU_SetParam = fake_set_param
+            fc.mu.MU_WriteParams = lambda _handle, _verify, _flags: fc.MU_OK
+            fc.mu.MU_WriteCmdRegister = fake_write_cmd
+
+            result = fc._compensate_zero_shift_from_derived_offsets(
+                fc.MU_Handle(),
+                baseline,
+                "unit test small residual",
+            )
+        finally:
+            fc._capture_protected_params = original_capture
+            fc._read_param = original_read_param
+            fc.mu.MU_SetParam = original_set_param
+            fc.mu.MU_WriteParams = original_write_params
+            fc.mu.MU_WriteCmdRegister = original_write_cmd
+
+        self.assertIsNotNone(result)
+        self.assertEqual(captures, [])
+        assert result is not None
+        self.assertEqual(result.params[fc.MU_OFF_ABZ.value].high, 0xF)
+        self.assertEqual(result.params[fc.MU_OFF_ABZ.value].low, 0xFFD14EDC)
+        self.assertIn(("set_param", fc.MU_OFF_ABZ.value, 0xF, 0xFFD14EDC), calls)
 
     def test_parse_args_defaults_to_node_50_and_125_kbit(self):
         args = fc.parse_args([])

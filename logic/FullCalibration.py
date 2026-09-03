@@ -57,6 +57,7 @@ ZERO_POSITION_TOLERANCE_COUNTS = 3
 ZERO_RETURN_RPM = 1000
 MU_OFF_ABZ_UNITS_PER_OFF_POS_TICK = 4096
 ZERO_COMPENSATION_MAX_ATTEMPTS = 3
+ZERO_DERIVED_OFFSET_TOLERANCE_COUNTS = 32
 
 EXPORT_DIR_1 = Path(
     r"/home/mobotic/Internal Projects/StCalibration-Linux/MU/calib_logs/enc_1"
@@ -641,6 +642,12 @@ def write_params_with_verify(handle: MU_Handle) -> int:
     return int(ret)
 
 
+def _write_eeprom_cfg(handle: MU_Handle, label: str) -> bool:
+    ret = mu.MU_WriteEeprom(handle, MU_E2P_CFG)
+    _log_mu(label, ret, handle)
+    return ret == MU_OK
+
+
 def _u32_value(value) -> int:
     return int(value.value if hasattr(value, "value") else value)
 
@@ -689,12 +696,19 @@ def _set_combined_param(
     return ret == MU_OK
 
 
-def _param_values_equal_modulo(expected: ProtectedMuParam, observed: ProtectedMuParam) -> bool:
+def _param_mod_delta(expected: ProtectedMuParam, observed: ProtectedMuParam) -> int:
     expected_value = _combined_param_value(expected)
     observed_value = _combined_param_value(observed)
     bits = _infer_offset_bits(expected_value, observed_value)
-    mask = (1 << bits) - 1
-    return (expected_value & mask) == (observed_value & mask)
+    return _signed_mod_delta(expected_value, observed_value, bits)
+
+
+def _param_values_equal_modulo(
+    expected: ProtectedMuParam,
+    observed: ProtectedMuParam,
+    tolerance_counts: int = 0,
+) -> bool:
+    return abs(_param_mod_delta(expected, observed)) <= int(tolerance_counts)
 
 
 def _read_master_period_count(handle: MU_Handle) -> int | None:
@@ -839,10 +853,17 @@ def _compensate_zero_shift_from_derived_offsets(
         return None
 
     mismatches = []
+    tolerated = []
     for derived_idx, expected in baseline_state.derived_params.items():
         observed = verified_state.derived_params.get(derived_idx)
-        if observed is None or not _param_values_equal_modulo(expected, observed):
+        if observed is None:
             mismatches.append((expected, observed))
+            continue
+        residual = _param_mod_delta(expected, observed)
+        if abs(residual) > ZERO_DERIVED_OFFSET_TOLERANCE_COUNTS:
+            mismatches.append((expected, observed))
+        elif residual != 0:
+            tolerated.append((expected, observed, residual))
 
     if mismatches:
         print("[ERROR] Encoder-side zero compensation did not restore derived offsets:")
@@ -865,6 +886,16 @@ def _compensate_zero_shift_from_derived_offsets(
                 attempt + 1,
             )
         return None
+
+    if tolerated:
+        for expected, observed, residual in tolerated:
+            print(
+                "[WARN] Encoder-side zero compensation accepted small derived offset "
+                f"residual for {expected.name}: residual={residual:+d} counts "
+                f"tolerance=+/-{ZERO_DERIVED_OFFSET_TOLERANCE_COUNTS} "
+                f"expected={_format_protected_param(expected)} "
+                f"observed={_format_protected_param(observed)}"
+            )
 
     print("[STATE] Encoder-side zero compensation restored derived offsets.")
     return ProtectedZeroState(
@@ -922,9 +953,7 @@ def _store_to_eeprom_and_set_mode(
         if current_zero_state is None:
             return False
 
-    ret = mu.MU_WriteCmdRegister(handle, MU_CMD_WRITE_ALL)
-    _log_mu("WRITE_ALL calibrated config after ABS_RESET", ret, handle)
-    if ret != MU_OK:
+    if not _write_eeprom_cfg(handle, "Write EEPROM CFG calibrated config in BiSS"):
         return False
 
     # Switch the live mode without verification, then store once more.
@@ -939,11 +968,67 @@ def _store_to_eeprom_and_set_mode(
     else:
         _log_mu("Set current MODEA final (no verify)", ret, handle)
 
-    ret = mu.MU_WriteCmdRegister(handle, MU_CMD_WRITE_ALL)
-    _log_mu("WRITE_ALL calibrated config in SSI", ret, handle)
-    if ret != MU_OK:
+    if not _write_eeprom_cfg(handle, "Write EEPROM CFG calibrated config in SSI"):
         return False
 
+    return True
+
+
+def _restore_original_config_after_failed_calibration(
+    handle: MU_Handle,
+    original_config_backup_path: Path | None,
+    protected_state: ProtectedZeroState,
+    zero_preserving_callback=None,
+) -> bool:
+    print("[INFO] Restoring original MU config after failed calibration.")
+    if not _load_mu_config(handle, original_config_backup_path):
+        print("[WARN] Could not reload original MU config after failed calibration.")
+        return False
+
+    ret = _write_params_preserving(
+        handle,
+        protected_state,
+        "restore original config after failed calibration",
+    )
+    if zero_preserving_callback is not None:
+        zero_preserving_callback(
+            {
+                "label": "restore original config after failed calibration",
+                "ok": ret == MU_OK,
+                "return_code": int(ret),
+            }
+        )
+    if ret != MU_OK:
+        print("[WARN] Original MU config load succeeded, but RAM restore failed.")
+        return False
+
+    if not _store_to_eeprom_and_set_mode(handle, MU_SSI, protected_state):
+        print(
+            "[ERROR] Failed calibration recovery could not persist the original "
+            "zero-preserving MU config to EEPROM."
+        )
+        if zero_preserving_callback is not None:
+            zero_preserving_callback(
+                {
+                    "label": "store restored original config after failed calibration",
+                    "ok": False,
+                    "return_code": 1,
+                }
+            )
+        return False
+
+    if zero_preserving_callback is not None:
+        zero_preserving_callback(
+            {
+                "label": "store restored original config after failed calibration",
+                "ok": True,
+                "return_code": MU_OK,
+            }
+        )
+    print(
+        "[INFO] Original MU config and protected zero parameters restored to EEPROM "
+        "after failed calibration."
+    )
     return True
 
 
@@ -1672,14 +1757,16 @@ def calibrate_one_encoder(
             f"[ERROR] Calibration failed after {max_calibration_attempts} attempts. "
             "The report files contain the final MU error metrics."
         )
-        print("[INFO] Restoring original MU config after failed calibration.")
-        if _load_mu_config(handle, original_config_backup_path):
-            if write_params_preserving_and_report(
-                "restore original config after failed calibration",
-            ) != MU_OK:
-                print("[WARN] Original MU config load succeeded, but RAM restore failed.")
-        else:
-            print("[WARN] Could not reload original MU config after failed calibration.")
+        if not _restore_original_config_after_failed_calibration(
+            handle,
+            original_config_backup_path,
+            protected_params,
+            zero_preserving_callback,
+        ):
+            print(
+                "[ERROR] Calibration failed and the original encoder config could not "
+                "be fully restored to EEPROM. Re-run Write Zero before using this motor."
+            )
         return False
 
     finally:
