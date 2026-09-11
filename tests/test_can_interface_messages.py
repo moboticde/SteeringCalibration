@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from main import CalibrationGUI as gui
+from utils import config_processing
 
 
 class CanInterfaceMessageTests(unittest.TestCase):
@@ -924,6 +925,120 @@ class CanInterfaceMessageTests(unittest.TestCase):
                 ("release", can, False),
             ],
         )
+
+    def test_parse_controller_can_bitrate_accepts_supported_values_only(self):
+        self.assertEqual(gui.parse_controller_can_bitrate("250"), 250)
+        with self.assertRaisesRegex(ValueError, "Controller CAN bitrate must be one of"):
+            gui.parse_controller_can_bitrate("333")
+
+    def test_run_controller_can_settings_change_writes_connected_controller(self):
+        class FakeNmt:
+            pass
+
+        class FakeNode:
+            nmt = FakeNmt()
+
+        class FakeMic:
+            added_node = FakeNode()
+
+            def __init__(self) -> None:
+                self.calls: list[tuple[object, ...]] = []
+
+            def set_can_node_id_and_bitrate(self, node, bitrate):
+                self.calls.append(("set_can", node, bitrate))
+                return True
+
+        mic = FakeMic()
+        can = object()
+        reset_calls: list[object] = []
+        original_can_ok = gui.STATE.can_connection_ok
+        original_can_node = gui.STATE.can_connection_node
+        original_can_bitrate = gui.STATE.can_connection_bitrate
+        original_manual_can = gui.STATE.manual_can
+        original_manual_mic = gui.STATE.manual_mic
+        original_reset = config_processing.nmt_reset_node_compat
+        try:
+            gui.STATE.set_manual_controller(50, 125, can, mic)
+            config_processing.nmt_reset_node_compat = (
+                lambda nmt: reset_calls.append(nmt) or True
+            )
+
+            ok, message = gui.run_controller_can_settings_change(
+                node=50,
+                can_bitrate=125,
+                new_node=51,
+                new_bitrate=250,
+            )
+        finally:
+            gui.STATE.can_connection_ok = original_can_ok
+            gui.STATE.can_connection_node = original_can_node
+            gui.STATE.can_connection_bitrate = original_can_bitrate
+            gui.STATE.manual_can = original_manual_can
+            gui.STATE.manual_mic = original_manual_mic
+            config_processing.nmt_reset_node_compat = original_reset
+
+        self.assertTrue(ok)
+        self.assertEqual(mic.calls, [("set_can", 51, 250)])
+        self.assertEqual(reset_calls, [mic.added_node.nmt])
+        self.assertIn("Reconnect CAN at the new settings", message)
+
+    def test_can_settings_change_requires_existing_connection_and_disconnects_after_finish(self):
+        class FakeCan:
+            def __init__(self) -> None:
+                self.closed = False
+
+            def close_can(self):
+                self.closed = True
+
+        can = FakeCan()
+        mic = object()
+        original_can_ok = gui.STATE.can_connection_ok
+        original_can_node = gui.STATE.can_connection_node
+        original_can_bitrate = gui.STATE.can_connection_bitrate
+        original_manual_can = gui.STATE.manual_can
+        original_manual_mic = gui.STATE.manual_mic
+        original_running = gui.STATE.running
+        original_inflight = gui.STATE.manual_requests_in_flight
+        original_check_running = gui.STATE.can_check_running
+        try:
+            gui.STATE.can_connection_ok = False
+            gui.STATE.can_connection_node = None
+            gui.STATE.can_connection_bitrate = 125
+            gui.STATE.manual_can = None
+            gui.STATE.manual_mic = None
+            gui.STATE.running = False
+            gui.STATE.manual_requests_in_flight = 0
+            gui.STATE.can_check_running = False
+
+            ok, error, current_node, current_bitrate = gui.STATE.begin_can_settings_change(51, 250)
+            self.assertFalse(ok)
+            self.assertIn("Connect to the current controller node", error)
+            self.assertIsNone(current_node)
+            self.assertIsNone(current_bitrate)
+
+            gui.STATE.set_manual_controller(50, 125, can, mic)
+            ok, error, current_node, current_bitrate = gui.STATE.begin_can_settings_change(51, 250)
+            self.assertTrue(ok)
+            self.assertEqual(error, "")
+            self.assertEqual((current_node, current_bitrate), (50, 125))
+
+            gui.STATE.finish_can_settings_change(51, 250, True, "changed")
+            gui.STATE.finish_manual_command()
+
+            self.assertTrue(can.closed)
+            self.assertFalse(gui.STATE.can_connection_ok)
+            self.assertEqual(gui.STATE.can_connection_node, 51)
+            self.assertEqual(gui.STATE.can_connection_bitrate, 250)
+            self.assertIsNone(gui.STATE.manual_mic)
+        finally:
+            gui.STATE.can_connection_ok = original_can_ok
+            gui.STATE.can_connection_node = original_can_node
+            gui.STATE.can_connection_bitrate = original_can_bitrate
+            gui.STATE.manual_can = original_manual_can
+            gui.STATE.manual_mic = original_manual_mic
+            gui.STATE.running = original_running
+            gui.STATE.manual_requests_in_flight = original_inflight
+            gui.STATE.can_check_running = original_check_running
 
     def test_controller_relay_restart_can_restore_operation_relay_mask(self):
         class FakeRelayArduino:

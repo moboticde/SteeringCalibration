@@ -26,7 +26,7 @@ EOL_CASE_ROOT = Path("/home/mobotic/Internal Projects/EOL-case/02_EOL_files")
 EOL_CASE_MAIN_PATH = EOL_CASE_ROOT / "main" / "mobotic_EOL.py"
 TRACTION_CALIBRATION_ROOT = Path("/home/mobotic/Internal Projects/TrCalibration-Linux")
 TRACTION_CALIBRATION_WORKBOOK = MANUFACTURING_ROOT / "Calibration.xlsx"
-TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE = "mb5u"
+TRACTION_CALIBRATION_DEFAULT_MHM_INTERFACE = "auto"
 TRACTION_MHM_USB_ADAPTER_IDS = {
     "1ae4:3101": "MB5U",
     "1ae4:0003": "MB4U",
@@ -455,15 +455,13 @@ def run_traction_calibration(product_barcode: object) -> bool:
         print(completed.stderr, end="" if completed.stderr.endswith("\n") else "\n")
 
     completed_output = f"{completed.stdout}\n{completed.stderr}"
-    diagnostic = traction_mhm_interface_diagnostic(
-        completed_output,
-        traction_lsusb_output() if traction_mhm_failure_detected(completed_output) else "",
-    )
-    if diagnostic:
-        print(diagnostic)
-
     attempt_zero, attempt_params = parse_attempt_9_calibration_zero(completed_output)
     status = "PASS" if completed.returncode == 0 and attempt_zero else "FAIL"
+    if status == "FAIL" and traction_mhm_failure_detected(completed_output):
+        diagnostic = traction_mhm_interface_diagnostic(completed_output, traction_lsusb_output())
+        if diagnostic:
+            print(diagnostic)
+
     append_traction_calibration_log(
         workbook_path=TRACTION_CALIBRATION_WORKBOOK,
         calibration_date=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -1512,6 +1510,61 @@ class AppState:
             self.manual_requests_in_flight += 1
             return True, ""
 
+    def begin_can_settings_change(
+        self,
+        new_node: int,
+        new_bitrate: int,
+    ) -> tuple[bool, str, int | None, int | None]:
+        with self.lock:
+            if self.running:
+                return False, "Another operation is already running.", None, None
+            if self.manual_requests_in_flight > 0:
+                return False, "A controller command is still finishing.", None, None
+            if (
+                self.can_check_running
+                or self.can_connection_ok is not True
+                or self.can_connection_node is None
+                or self.manual_mic is None
+            ):
+                return (
+                    False,
+                    "Connect to the current controller node before changing CAN settings.",
+                    None,
+                    None,
+                )
+
+            current_node = self.can_connection_node
+            current_bitrate = self.can_connection_bitrate
+            self.manual_requests_in_flight += 1
+            self.activity_label = "CAN settings"
+            self.activity_step = (
+                f"Changing controller CAN settings to node {new_node}, "
+                f"{new_bitrate} kbit/s..."
+            )
+            self.activity_state = "running"
+            self.status_lines = [self.activity_step]
+            self.has_error = False
+            return True, "", current_node, current_bitrate
+
+    def finish_can_settings_change(self, new_node: int, new_bitrate: int, ok: bool, message: str) -> None:
+        can_to_close = None
+        with self.lock:
+            can_to_close = self._detach_manual_controller_locked(message=message)
+            self.can_connection_node = new_node
+            self.can_connection_bitrate = new_bitrate
+            self.can_connection_ok = False
+            self.can_connection_message = message
+            self.has_error = not ok
+            self.activity_label = "CAN settings"
+            self.activity_step = message
+            self.activity_state = "done" if ok else "fail"
+            self.status_lines = [self.activity_step]
+        if can_to_close is not None:
+            try:
+                can_to_close.close_can()
+            except Exception:
+                pass
+
     def set_controller_enabled(self, node: int, enabled: bool) -> None:
         with self.lock:
             if self.can_connection_node == node:
@@ -2518,6 +2571,44 @@ def run_controller_clear_errors(
         return False, "CAN node is not connected."
     mic.clear_errors()
     message = f"Controller errors cleared on node {node}."
+    print(f"[STATUS] {message}")
+    return True, message
+
+
+def run_controller_can_settings_change(
+    node: int,
+    can_bitrate: int,
+    new_node: int,
+    new_bitrate: int,
+) -> tuple[bool, str]:
+    _can, mic = STATE.get_manual_controller(node, can_bitrate)
+    if mic is None:
+        return False, "CAN node is not connected."
+    if not hasattr(mic, "set_can_node_id_and_bitrate"):
+        return False, "Connected controller driver cannot change CAN settings."
+
+    print(
+        "[STATUS] Changing controller CAN settings: "
+        f"current node {node}, {can_bitrate} kbit/s -> "
+        f"node {new_node}, {new_bitrate} kbit/s."
+    )
+    ok = mic.set_can_node_id_and_bitrate(new_node, new_bitrate)
+    if not ok:
+        return False, "Controller CAN settings change failed. Open Debug for details."
+
+    reset_sent = False
+    try:
+        from utils.config_processing import nmt_reset_node_compat
+
+        reset_sent = nmt_reset_node_compat(mic.added_node.nmt)
+    except Exception as exc:
+        print(f"[WARN] Could not send NMT reset after CAN settings change: {exc}")
+
+    reset_text = "NMT reset sent." if reset_sent else "Power cycle may be required."
+    message = (
+        f"Controller CAN settings changed to node {new_node}, "
+        f"{new_bitrate} kbit/s. {reset_text} Reconnect CAN at the new settings."
+    )
     print(f"[STATUS] {message}")
     return True, message
 
@@ -3924,6 +4015,18 @@ def parse_can_bitrate(raw_value: str) -> int:
     return bitrate
 
 
+def parse_controller_can_bitrate(raw_value: str) -> int:
+    bitrate = parse_can_bitrate(raw_value)
+    from drivers.driver_miControlF35 import CAN_BITRATE_CODE_BY_KBIT
+
+    if bitrate not in CAN_BITRATE_CODE_BY_KBIT:
+        supported = ", ".join(str(rate) for rate in sorted(CAN_BITRATE_CODE_BY_KBIT, reverse=True))
+        raise ValueError(
+            f"Controller CAN bitrate must be one of: {supported} kbit/s."
+        )
+    return bitrate
+
+
 def parse_enabled(raw_value: str) -> bool:
     if raw_value in {"1", "true", "True", "on"}:
         return True
@@ -5294,6 +5397,53 @@ class CalibrationRequestHandler(BaseHTTPRequestHandler):
                 STATE.append_log(format_exc())
                 message = f"Clear error failed on node {node}. ({exc})"
                 STATE.append_status(message, is_error=True)
+                self._send_json({"ok": False, "error": message})
+            finally:
+                STATE.finish_manual_command()
+            return
+
+        if parsed.path == "/change-can-settings":
+            query = parse_qs(parsed.query)
+            try:
+                new_node = parse_can_node(query.get("node", [""])[0])
+                new_bitrate = parse_controller_can_bitrate(query.get("bitrate", [""])[0])
+            except ValueError as exc:
+                self._send_json({"ok": False, "error": str(exc)})
+                return
+
+            ok, error, current_node, current_bitrate = STATE.begin_can_settings_change(
+                new_node,
+                new_bitrate,
+            )
+            if not ok:
+                self._send_json({"ok": False, "error": error})
+                return
+
+            writer = QueueWriter(STATE)
+            try:
+                with contextlib.redirect_stdout(writer), contextlib.redirect_stderr(writer):
+                    ok, message = gui_safe_execute(
+                        run_controller_can_settings_change,
+                        node=current_node,
+                        can_bitrate=current_bitrate,
+                        new_node=new_node,
+                        new_bitrate=new_bitrate,
+                        spinner_text="Changing controller CAN settings",
+                    )
+                STATE.finish_can_settings_change(new_node, new_bitrate, ok, message)
+                self._send_json(
+                    {
+                        "ok": ok,
+                        "message": message if ok else "",
+                        "error": "" if ok else message,
+                        "can_connection_ok": False,
+                        "controller_enabled": False,
+                    }
+                )
+            except Exception as exc:
+                STATE.append_log(format_exc())
+                message = f"Controller CAN settings change failed. ({exc})"
+                STATE.finish_can_settings_change(new_node, new_bitrate, False, message)
                 self._send_json({"ok": False, "error": message})
             finally:
                 STATE.finish_manual_command()
