@@ -949,6 +949,45 @@ SinOff: 0 | CosOff: 0 | GainC: 0 | Harm4: 0 | RPM: 100
     ]
 
 
+def test_run_traction_calibration_suppresses_retry_diagnostic_on_pass(tmp_path, monkeypatch, capsys):
+    calibration_root = tmp_path / "TrCalibration"
+    calibration_root.mkdir()
+    (calibration_root / "ST_Calibration.py").write_text("# fake\n", encoding="utf-8")
+    workbook = tmp_path / "Calibration.xlsx"
+
+    class Completed:
+        returncode = 0
+        stdout = """
+Trying MHM connection switch-ex TTL=0x01, RTX_MODE=0x00.
+MHM connection switch-ex TTL=0x01, RTX_MODE=0x00 failed: Initialization failed: eMHM_BISSCOMM_FAILED (13)
+Trying MHM connection switch-ex TTL=0x00, RTX_MODE=0x01.
+MHM BiSS connection verified using switch-ex TTL=0x00, RTX_MODE=0x01.
+Running Calibration Attempt 9...
+SinOff: 0 | CosOff: 0 | GainC: 0 | Harm4: 0 | RPM: 2191
+"""
+        stderr = ""
+
+    monkeypatch.setattr(gui, "TRACTION_CALIBRATION_ROOT", calibration_root)
+    monkeypatch.setattr(gui, "TRACTION_CALIBRATION_WORKBOOK", workbook)
+    monkeypatch.setattr(gui.subprocess, "run", lambda *args, **kwargs: Completed())
+    monkeypatch.setattr(
+        gui,
+        "traction_lsusb_output",
+        lambda: (_ for _ in ()).throw(AssertionError("lsusb should not run on PASS")),
+    )
+
+    assert gui.run_traction_calibration("99039195452126039651221119303") is True
+
+    output = capsys.readouterr().out
+    assert "MHM BiSS communication failed during traction calibration" not in output
+    assert gui.read_conf_xlsx_rows(workbook)[1] == [
+        gui.read_conf_xlsx_rows(workbook)[1][0],
+        "99039195452126039651221119303",
+        "ST",
+        "PASS",
+    ]
+
+
 def test_scan_option_parser_accepts_known_options():
     assert gui.parse_scan_option("qr_camera") == "qr_camera"
     assert gui.parse_scan_option("qr_scanner") == "qr_scanner"

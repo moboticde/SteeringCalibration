@@ -2,6 +2,18 @@ import time
 import os
 
 CANOPEN_SAVE_SIGNATURE = 0x65766173
+CANOPEN_WRITE_ENABLE_SIGNATURE = 0x6E657277
+CAN_BITRATE_CODE_BY_KBIT = {
+    1000: 0,
+    800: 1,
+    500: 2,
+    250: 3,
+    125: 4,
+    100: 5,
+    50: 6,
+    20: 7,
+    10: 8,
+}
 MICON_I32_MIN = -(2**31)
 MICON_I32_MAX = 2**31 - 1
 SSI_ZERO_POSITION_TOLERANCE_COUNTS = 3
@@ -18,6 +30,18 @@ def _checked_i32(value, label):
             f"value={value} range=[{MICON_I32_MIN}..{MICON_I32_MAX}]"
         )
     return value
+
+
+def can_bitrate_code_for_kbit(can_bitrate_kbit):
+    bitrate = int(float(can_bitrate_kbit))
+    try:
+        return CAN_BITRATE_CODE_BY_KBIT[bitrate]
+    except KeyError:
+        supported = ", ".join(str(rate) for rate in sorted(CAN_BITRATE_CODE_BY_KBIT, reverse=True))
+        raise ValueError(
+            f"Unsupported controller CAN bitrate {bitrate} kbit/s. "
+            f"Supported values: {supported}."
+        )
 
 class MicontrolF35_CAN: 
     def __init__(self, can, node):
@@ -184,6 +208,72 @@ class MicontrolF35_CAN:
             return True
         except Exception as e:
             print(f"[ERROR] Failed to store controller parameters: {e}")
+            return False
+
+    def _download_unsigned_with_size_retry(
+        self,
+        index: int,
+        subindex: int,
+        value: int,
+        *,
+        sizes: tuple[int, ...] = (1, 2, 4),
+    ) -> None:
+        last_error = None
+        for size in sizes:
+            try:
+                payload = int(value).to_bytes(size, byteorder='little', signed=False)
+                self.added_node.sdo.download(index, subindex, payload)
+                return
+            except OverflowError:
+                continue
+            except Exception as exc:
+                last_error = exc
+                if "0x06070010" in str(exc):
+                    continue
+                raise
+        raise RuntimeError(
+            f"SDO write failed {index:04X}h/{subindex:02X}h -> {value}: {last_error}"
+        )
+
+    def set_can_node_id_and_bitrate(self, node_id: int, can_bitrate_kbit: int) -> bool:
+        """Write MiControl CANopen node ID and device baud code."""
+        if not self.added_node:
+            return False
+
+        node_id = int(node_id)
+        if not 1 <= node_id <= 127:
+            raise ValueError("CAN node ID must be between 1 and 127.")
+        baud_code = can_bitrate_code_for_kbit(can_bitrate_kbit)
+
+        try:
+            try:
+                self.enabled(False)
+                time.sleep(0.25)
+            except Exception as exc:
+                print(f"[WARN] Could not disable controller before CAN settings write: {exc}")
+
+            self._download_unsigned_with_size_retry(
+                0x2000,
+                0x01,
+                CANOPEN_WRITE_ENABLE_SIGNATURE,
+                sizes=(4,),
+            )
+            self._download_unsigned_with_size_retry(0x2000, 0x02, node_id)
+            self._download_unsigned_with_size_retry(
+                0x2000,
+                0x01,
+                CANOPEN_WRITE_ENABLE_SIGNATURE,
+                sizes=(4,),
+            )
+            self._download_unsigned_with_size_retry(0x2000, 0x03, baud_code)
+
+            save_signature = CANOPEN_SAVE_SIGNATURE
+            self._download_unsigned_with_size_retry(0x1010, 0x02, save_signature, sizes=(4,))
+            self._download_unsigned_with_size_retry(0x1010, 0x05, save_signature, sizes=(4,))
+            time.sleep(1.0)
+            return True
+        except Exception as e:
+            print(f"[ERROR] Failed to change controller CAN settings: {e}")
             return False
 
     def _wait_for_steering_zero_after_write(self, timeout_s: float) -> int | None:

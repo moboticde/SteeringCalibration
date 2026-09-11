@@ -338,8 +338,11 @@
       font-size: 12px;
     }
 
-    #connect-can {
+    .can-link-actions {
       grid-column: 1 / -1;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 8px;
     }
 
     label {
@@ -1121,7 +1124,14 @@
       font-weight: 500;
     }
 
-    .ux-hardware #connect-can {
+    .ux-hardware .can-link-actions {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .ux-hardware #connect-can,
+    .ux-hardware #change-can-settings {
       display: grid;
       grid-template-columns: 28px max-content;
       align-items: center;
@@ -1460,7 +1470,10 @@
           <label for="can-bitrate">Bitrate (kbit/s)
             <input id="can-bitrate" type="number" min="1" max="1000" step="1" value="125" inputmode="numeric">
           </label>
-          <button id="connect-can" type="button"><span>↔</span>Connect</button>
+          <div class="can-link-actions">
+            <button id="connect-can" type="button"><span>↔</span>Connect</button>
+            <button id="change-can-settings" type="button"><span>↦</span>Change</button>
+          </div>
           <div class="controller-actions">
             <button id="drive-enable" type="button">Enable</button>
             <button id="clear-errors" type="button">Clear error</button>
@@ -1526,6 +1539,7 @@
     const canNodeInputEl = document.querySelector("#can-node");
     const canBitrateInputEl = document.querySelector("#can-bitrate");
     const connectCanEl = document.querySelector("#connect-can");
+    const changeCanSettingsEl = document.querySelector("#change-can-settings");
     const driveEnableEl = document.querySelector("#drive-enable");
     const clearErrorsEl = document.querySelector("#clear-errors");
     const systemStatusEl = document.querySelector("#system-status");
@@ -1597,6 +1611,7 @@
     let awaitingRelayConfirmation = false;
     let activeWorkflowTab = "";
     let awaitingProductScanPrompt = false;
+    let canTargetDirty = false;
     let spinnerFrame = 0;
     const SPINNER_FRAMES = ["|", "/", "-", "\\"];
 
@@ -1614,6 +1629,7 @@
     function updateCanControls(isBusy = false) {
       driveEnableEl.textContent = controllerEnabled ? "Disable" : "Enable";
       connectCanEl.disabled = isBusy;
+      changeCanSettingsEl.disabled = isBusy || !canConnected;
       driveEnableEl.disabled = isBusy || !canConnected;
       clearErrorsEl.disabled = isBusy || !canConnected;
       relayModeEl.disabled = isBusy;
@@ -2219,10 +2235,10 @@
         if (document.activeElement !== scanOptionEl && data.scan_option) {
           scanOptionEl.value = data.scan_option;
         }
-        if (document.activeElement !== canNodeInputEl && data.can_connection_node !== null && data.can_connection_node !== undefined) {
+        if (!canTargetDirty && document.activeElement !== canNodeInputEl && data.can_connection_node !== null && data.can_connection_node !== undefined) {
           canNodeInputEl.value = String(data.can_connection_node);
         }
-        if (document.activeElement !== canBitrateInputEl && data.can_connection_bitrate !== null && data.can_connection_bitrate !== undefined) {
+        if (!canTargetDirty && document.activeElement !== canBitrateInputEl && data.can_connection_bitrate !== null && data.can_connection_bitrate !== undefined) {
           canBitrateInputEl.value = String(data.can_connection_bitrate);
         }
         if (document.activeElement !== relayModeEl && data.relay_mode) {
@@ -2323,6 +2339,7 @@
         canCheckRunning = false;
         controllerEnabled = data.controller_enabled === true;
         if (data.ok) {
+          canTargetDirty = false;
           setCanStatus(data.message || "CAN connected.", "ok");
           setActivityMessage("CAN connected", data.message || "Ready.", false);
         } else if (data.quiet === true) {
@@ -2340,6 +2357,41 @@
         setCanStatus(`CAN check failed: ${error}`, "fail");
         setActivityMessage("CAN check failed", String(error), true);
         setView("status");
+      }
+      setBusy(false);
+      await refreshStatus();
+    }
+
+    async function changeCanSettings() {
+      if (!canConnected) {
+        setActivityMessage("CAN node is not connected", "Connect to the current controller node first.", true);
+        setView("status");
+        return;
+      }
+      let params;
+      try {
+        params = selectedCanTargetParams();
+      } catch (error) {
+        setActivityMessage("Invalid CAN settings", error.message, true);
+        setView("status");
+        return;
+      }
+      setBusy(true);
+      setActivityMessage("Changing CAN settings", "Writing controller communication parameters.", false);
+      setView("status");
+      try {
+        const response = await fetch(`/change-can-settings?${params.toString()}`, { method: "POST" });
+        const data = await response.json();
+        canConnected = data.can_connection_ok === true;
+        controllerEnabled = data.controller_enabled === true;
+        canTargetDirty = false;
+        if (!data.ok) {
+          setActivityMessage("CAN settings failed", data.error || "Could not change controller CAN settings.", true);
+        } else {
+          setActivityMessage("CAN settings changed", data.message || "Reconnect CAN at the new settings.", false);
+        }
+      } catch (error) {
+        setActivityMessage("Server connection problem", String(error), true);
       }
       setBusy(false);
       await refreshStatus();
@@ -2516,7 +2568,13 @@
     });
     rescanProductEl.addEventListener("click", rescanProduct);
 
+    [canNodeInputEl, canBitrateInputEl].forEach((inputEl) => {
+      inputEl.addEventListener("input", () => {
+        canTargetDirty = true;
+      });
+    });
     connectCanEl.addEventListener("click", () => checkCanConnection(true));
+    changeCanSettingsEl.addEventListener("click", changeCanSettings);
     driveEnableEl.addEventListener("click", toggleControllerEnabled);
     clearErrorsEl.addEventListener("click", clearControllerErrors);
     relaysPowerOnEl.addEventListener("click", () => runRelayAction("power_on"));
